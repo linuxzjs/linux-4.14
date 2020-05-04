@@ -1,0 +1,11 @@
+#!/bin/sh
+##  rootfs archive pack script, created by zhaojinsheng
+
+gunzip rootfs.cpio.gz
+mkdir rootfs
+cd rootfs
+cpio -ivmd < ../rootfs.cpio
+
+echo "**************************unpack rootfs sucess*******************"
+
+

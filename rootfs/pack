@@ -1,0 +1,9 @@
+#!/bin/sh
+##  rootfs archive pack script, created by zhaojinsheng
+cd rootfs
+find . | cpio -o -H newc | gzip > ../rootfs.cpio.gz
+cd ../
+
+echo "**************************pack rootfs sucess*******************"
+
+
