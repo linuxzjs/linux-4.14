@@ -2843,7 +2843,9 @@ static inline void cfs_rq_util_change(struct cfs_rq *cfs_rq)
 static u64 decay_load(u64 val, u64 n)
 {
 	unsigned int local_n;
-
+    /*判断load衰变的周期，当衰败周期n > 32*63时直接val衰变为0
+    val*yn=0, n > 2016
+    */
 	if (unlikely(n > LOAD_AVG_PERIOD * 63))
 		return 0;
 
@@ -2857,11 +2859,17 @@ static u64 decay_load(u64 val, u64 n)
 	 *
 	 * To achieve constant time decay_load.
 	 */
+	 /*如果N<32则无需使用y^32=0.5这个原则，直接进入runnable_avg_yN_inv完成相关计算
+	   如果N>=32 local_n / LOAD_AVG_PERIOD的出有多少个32，假设local_n=65，此时local_n / LOAD_AVG_PERIOD = 2
+	   此时val>>2 就等于val/4也就是val*(1/2)^2.同时通过local_n %= LOAD_AVG_PERIOD得到32整数倍之外的值比如此时就是1
+	   总的描述下来就是当n大于等于32的时候，就需要根据y^32=0.5条件计算y^n的值。
+	   （y^n)*(2^32) = (1/2)^(n/32) * y^(n%32)*2^32 = (1/2)^(n/32) * runnable_avg_yN_inv[n%32]
+	 */
 	if (unlikely(local_n >= LOAD_AVG_PERIOD)) {
 		val >>= local_n / LOAD_AVG_PERIOD;
 		local_n %= LOAD_AVG_PERIOD;
 	}
-
+    //使用val*(1/2)^n后的val在runnable_avg_yN_inv中完成数据的查询，最终得到衰变后的load
 	val = mul_u64_u32_shr(val, runnable_avg_yN_inv[local_n], 32);
 	return val;
 }
@@ -2873,6 +2881,7 @@ static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
 	/*
 	 * c1 = d1 y^p
 	 */
+	//完成d1的负载衰变计算
 	c1 = decay_load((u64)d1, periods);
 
 	/*
@@ -2884,8 +2893,9 @@ static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
 	 *    = 1024 ( \Sum y^n - \Sum y^n - y^0 )
 	 *              n=0        n=p
 	 */
+	//完成c2的负载衰变计算，这个原理我们在文档中已经做过详细分析了，这里就不重复的推算了
 	c2 = LOAD_AVG_MAX - decay_load(LOAD_AVG_MAX, periods) - 1024;
-
+    //delta = c1 + c2 +c3就计算出delta这段时间内的总的负载值
 	return c1 + c2 + c3;
 }
 
@@ -2919,17 +2929,23 @@ accumulate_sum(u64 delta, int cpu, struct sched_avg *sa,
 	unsigned long scale_freq, scale_cpu;
 	u32 contrib = (u32)delta; /* p == 0 -> delta < 1024 */
 	u64 periods;
-
+    //获取当前CPU 频率
 	scale_freq = arch_scale_freq_capacity(NULL, cpu);
 	scale_cpu = arch_scale_cpu_capacity(NULL, cpu);
-
+    /*period_contrib可以理解为上一次计算负载时的delta3  
+      delta是经过的时间，为了计算经过的周期个数需要加上period_contrib，然后整除1024，
+      如果不加上period_contrib在做负载衰变时就会少一个周期
+    */
 	delta += sa->period_contrib;
+    //判断出delta共经历了多少个周期，以便于后期计算oldload衰变使用
 	periods = delta / 1024; /* A period is 1024us (~1ms) */
 
 	/*
 	 * Step 1: decay old *_sum if we crossed period boundaries.
 	 */
 	if (periods) {
+        /*完成这里load_sum就相当于oldload，完成oldload的衰变
+        */
 		sa->load_sum = decay_load(sa->load_sum, periods);
 		if (cfs_rq) {
 			cfs_rq->runnable_load_sum =
@@ -2940,10 +2956,16 @@ accumulate_sum(u64 delta, int cpu, struct sched_avg *sa,
 		/*
 		 * Step 2
 		 */
+		/*完成delta的 负载计算，这里periods是周期数，1024 - sa->period_contrib相当于d1
+		delta = delta%1024相当于d3
+		*/
 		delta %= 1024;
 		contrib = __accumulate_pelt_segments(periods,
 				1024 - sa->period_contrib, delta);
 	}
+    /*更新period_contrib下次负载计算时使用，就相当于下一次的period_contrib，
+    也就是1024- sa->period_contrib得到d1
+    */
 	sa->period_contrib = delta;
 
 	contrib = cap_scale(contrib, scale_freq);
@@ -2991,12 +3013,14 @@ ___update_load_avg(u64 now, int cpu, struct sched_avg *sa,
 		  unsigned long weight, int running, struct cfs_rq *cfs_rq)
 {
 	u64 delta;
-
+    /*当前时间now 减去 sa->last_update_time得到进程执行的总时间delta
+    */
 	delta = now - sa->last_update_time;
 	/*
 	 * This should only happen when time goes backwards, which it
 	 * unfortunately does during sched clock init when we swap over to TSC.
 	 */
+	 //如果时间小于0,则直接返回，并将当前时间now赋给last_update_time下次计算负载时再用
 	if ((s64)delta < 0) {
 		sa->last_update_time = now;
 		return 0;
@@ -3006,10 +3030,13 @@ ___update_load_avg(u64 now, int cpu, struct sched_avg *sa,
 	 * Use 1024ns as the unit of measurement since it's a reasonable
 	 * approximation of 1us and fast to compute.
 	 */
+	/*delta时间时ns，将去转换乘us为单位
+	*/
 	delta >>= 10;
 	if (!delta)
 		return 0;
 
+    //更新负载时间
 	sa->last_update_time += delta << 10;
 
 	/*
@@ -3031,6 +3058,7 @@ ___update_load_avg(u64 now, int cpu, struct sched_avg *sa,
 	 * Step 1: accumulate *_sum since last_update_time. If we haven't
 	 * crossed period boundaries, finish.
 	 */
+	 //调用调用accumulate_sum计算delta负载
 	if (!accumulate_sum(delta, cpu, sa, weight, running, cfs_rq))
 		return 0;
 
@@ -5118,14 +5146,19 @@ static void cpu_load_update(struct rq *this_rq, unsigned long this_load,
 	this_rq->nr_load_updates++;
 
 	/* Update our load: */
+     /*将当前最新的load,更新在cpu_load[0]中*/
 	this_rq->cpu_load[0] = this_load; /* Fasttrack for idx 0 */
 	for (i = 1, scale = 2; i < CPU_LOAD_IDX_MAX; i++, scale += scale) {
 		unsigned long old_load, new_load;
 
 		/* scale is effectively 1 << i now, and >> i divides by scale */
-
+        /*记录上一个tick的可执行队列rq的cpu负载，作为oldload*/
 		old_load = this_rq->cpu_load[i];
 #ifdef CONFIG_NO_HZ_COMMON
+        /*当进入NO_HZ模式后，会对oldload做衰变计算，这个计算的过程就是在
+        decay_load_missed函数当中，后续会对该函数做详细分析，当pending_updates = 1
+        时，pending_updates - 1= 0说明是非NO_HZ模式下oldload还是等于oldload并没有做任何的衰变操作
+        */
 		old_load = decay_load_missed(old_load, pending_updates - 1, i);
 		if (tickless_load) {
 			old_load -= decay_load_missed(tickless_load, pending_updates - 1, i);
@@ -5137,6 +5170,7 @@ static void cpu_load_update(struct rq *this_rq, unsigned long this_load,
 			old_load += tickless_load;
 		}
 #endif
+        //将最新的this_load作为newload
 		new_load = this_load;
 		/*
 		 * Round up the averaging division if load is increasing. This
@@ -5145,7 +5179,10 @@ static void cpu_load_update(struct rq *this_rq, unsigned long this_load,
 		 */
 		if (new_load > old_load)
 			new_load += scale - 1;
-
+        /*通过该衰变计算将最终的load存储在对应的cpu_load[i]当中。
+        在非NO_HZ模式下就是load[i]' = (1 - 1/2^i) * load[i] + (1/2^i) * load
+        此时oldload=load[i], newload=load
+        */
 		this_rq->cpu_load[i] = (old_load * (scale - 1) + new_load) >> i;
 	}
 

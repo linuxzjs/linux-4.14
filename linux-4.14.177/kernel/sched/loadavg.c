@@ -80,6 +80,7 @@ void get_avenrun(unsigned long *loads, unsigned long offset, int shift)
 	loads[2] = (avenrun[2] + offset) << shift;
 }
 
+//atcive task统计，active task包括runing，uninterruptible task两种
 long calc_load_fold_active(struct rq *this_rq, long adjust)
 {
 	long nr_active, delta = 0;
@@ -102,7 +103,10 @@ static unsigned long
 calc_load(unsigned long load, unsigned long exp, unsigned long active)
 {
 	unsigned long newload;
-
+    /*load 值其实就是old load，需要做相应的衰减操作，通过衰减后的old load
+    在加上active task计算出来的新增负载就得到了new load全局cpu 负载
+    至于为什么这样设计，目前没有找到相关的文档去解释。
+    */
 	newload = load * exp + active * (FIXED_1 - exp);
 	if (active >= load)
 		newload += FIXED_1-1;
@@ -244,6 +248,7 @@ static long calc_load_nohz_fold(void)
  * of course trivially computable in O(log_2 n), the length of our binary
  * vector.
  */
+ //预测出进入NO_HZ模式N个周期的exp数据
 static unsigned long
 fixed_power_int(unsigned long x, unsigned int frac_bits, unsigned int n)
 {
@@ -252,8 +257,15 @@ fixed_power_int(unsigned long x, unsigned int frac_bits, unsigned int n)
 	if (n) {
 		for (;;) {
 			if (n & 1) {
+                /*
+                * 模拟浮点乘法，例如：
+                * result = 0.21 * FIXED_1
+                * x = 0.92 * FIXED_1
+                * result * x = 0.21 * 0.92 * FIXED_1
+                * = 0.21 FIXED_1 * 0.92 * FIXED_1 / FIXED_1
+                */
 				result *= x;
-				result += 1UL << (frac_bits - 1);
+				result += 1UL << (frac_bits - 1);//相当于FIXED_1/2，做四舍五入
 				result >>= frac_bits;
 			}
 			n >>= 1;
@@ -291,6 +303,12 @@ fixed_power_int(unsigned long x, unsigned int frac_bits, unsigned int n)
  *     S_n := \Sum x^i = -------------
  *             i=0          1 - x
  */
+ /*函数头这个注释中，a0 为旧值，推导了补偿到 a1（a0 之后的一个 5s 周期），
+ 补偿到 a2（a0 之后两个周期），一直到 an（a0 之后 n 个周期），
+ 留意 an 推导中，1 + e + ... + e^n-1 = 1 * (1 - e^n) / (1 - e)，
+ 应用了等比数列求和公式（共 n 项，比值为 e，第一项为 e^0 == 1）
+ 最后，fixed_power_int() 是个浮点数 “整数次方” 的模拟也就是NO_HZ模式下的exp
+*/
 static unsigned long
 calc_load_n(unsigned long load, unsigned long exp,
 	    unsigned long active, unsigned int n)
@@ -313,20 +331,30 @@ static void calc_global_nohz(void)
 	long delta, active, n;
 
 	sample_window = READ_ONCE(calc_load_update);
+    /*判断时间超过10个tick，则计算在no_hz模式cpu 负载
+    */
 	if (!time_before(jiffies, sample_window + 10)) {
 		/*
 		 * Catch-up, fold however many we are behind still
 		 */
+		 /*当前时间减去当前calc_load_update+10s，计算出进入no_hz的总时间 
+		 */
 		delta = jiffies - sample_window - 10;
+        /*n 就是进入no_hz的周期数， CPU 进入 nohz，采样间隔可能 >5s，
+        即可能错过多个采样周期，需要一次性补回来，同时留意补偿后，
+        calc_load_update 须是个未来的时间戳，故而 n 计算中还有 “+ 1”
+        */
 		n = 1 + (delta / LOAD_FREQ);
 
 		active = atomic_long_read(&calc_load_tasks);
 		active = active > 0 ? active * FIXED_1 : 0;
 
+        //完成no_hz模式下的负载计算calc_load_n函数至关重要
 		avenrun[0] = calc_load_n(avenrun[0], EXP_1, active, n);
 		avenrun[1] = calc_load_n(avenrun[1], EXP_5, active, n);
 		avenrun[2] = calc_load_n(avenrun[2], EXP_15, active, n);
 
+        //更新calc_load_update时间，将进入no_hz的周期数补充到calc_load_update当中，在下一个运算周期使用
 		WRITE_ONCE(calc_load_update, sample_window + n * LOAD_FREQ);
 	}
 
@@ -365,23 +393,30 @@ void calc_global_load(unsigned long ticks)
 	/*
 	 * Fold the 'old' NO_HZ-delta to include all NO_HZ cpus.
 	 */
+	//如果系统进入了no_hz模式就需要更新active task的值
 	delta = calc_load_nohz_fold();
 	if (delta)
 		atomic_long_add(delta, &calc_load_tasks);
 
+    //读取当前active task的数量，如果>0,则active = active*2048作为基准，否则为0。
 	active = atomic_long_read(&calc_load_tasks);
 	active = active > 0 ? active * FIXED_1 : 0;
 
+    /*calc_load函数完成1，5，15分钟全局负载的计算，是计算整个全局cpu负载的核心操作
+      后边会详细分析该函数
+    */
 	avenrun[0] = calc_load(avenrun[0], EXP_1, active);
 	avenrun[1] = calc_load(avenrun[1], EXP_5, active);
 	avenrun[2] = calc_load(avenrun[2], EXP_15, active);
 
+    //计算完成后增加5s作为一个计算周期
 	WRITE_ONCE(calc_load_update, sample_window + LOAD_FREQ);
 
 	/*
 	 * In case we went to NO_HZ for multiple LOAD_FREQ intervals
 	 * catch up in bulk.
 	 */
+	//同样进入nohz模式后需要更新avenrun负载
 	calc_global_nohz();
 }
 
