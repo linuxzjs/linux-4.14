@@ -25,7 +25,7 @@ elif [ "$str" == "kernel" ]; then
 elif [ "$str" == "clean" ]; then
 	make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- distclean
 elif [ "$str" == "startup" ]; then
-	qemu-system-aarch64 -machine virt -cpu cortex-a53 -machine type=virt -nographic -m 1024 -smp 2 -kernel arch/arm64/boot/Image --append "rdinit=/linuxrc console=ttyAMA0"
+	qemu-system-aarch64 -machine virt -cpu cortex-a53 -machine type=virt -nographic -m 1024 -smp 2 -kernel arch/arm64/boot/Image --append "rdinit=/linuxrc console=ttyAMA0 rw crashkernel=512M"
 elif [ "$str" == "gdb" ]; then
 	qemu-system-aarch64 -s -S -machine virt -cpu cortex-a53 -machine type=virt -nographic -m 1024 -smp 2 -kernel arch/arm64/boot/Image --append "rdinit=/linuxrc console=ttyAMA0"
 else
