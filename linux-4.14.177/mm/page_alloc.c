@@ -6018,7 +6018,7 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat)
 {
 	enum zone_type j;
 	int nid = pgdat->node_id;
-
+    //自旋锁的初始化
 	pgdat_resize_init(pgdat);
 #ifdef CONFIG_NUMA_BALANCING
 	spin_lock_init(&pgdat->numabalancing_migrate_lock);
@@ -6030,22 +6030,29 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat)
 	INIT_LIST_HEAD(&pgdat->split_queue);
 	pgdat->split_queue_len = 0;
 #endif
+    /*  初始化pgdat->kswapd_wait等待队列  */
 	init_waitqueue_head(&pgdat->kswapd_wait);
+    /*  初始化页换出守护进程创建空闲块的大小
+     为2^kswapd_max_order
+     */
 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
 #ifdef CONFIG_COMPACTION
 	init_waitqueue_head(&pgdat->kcompactd_wait);
 #endif
 	pgdat_page_ext_init(pgdat);
 	spin_lock_init(&pgdat->lru_lock);
+    /* 初始化lru相关成员 */
 	lruvec_init(node_lruvec(pgdat));
 
 	pgdat->per_cpu_nodestats = &boot_nodestats;
-
+    
 	for (j = 0; j < MAX_NR_ZONES; j++) {
 		struct zone *zone = pgdat->node_zones + j;
 		unsigned long size, realsize, freesize, memmap_pages;
 		unsigned long zone_start_pfn = zone->zone_start_pfn;
-
+        /*spanned_pages ZONE中总共的页面数，包含空洞的区域
+          present_pages ZONE里实际管理的页面数量，也就是实际可用的页面数量
+        */
 		size = zone->spanned_pages;
 		realsize = freesize = zone->present_pages;
 
@@ -6053,6 +6060,9 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat)
 		 * Adjust freesize so that it accounts for how much memory
 		 * is used by this zone for memmap. This affects the watermark
 		 * and per-cpu initialisations
+		 */
+		 /*计算出所有页框占page的大小，可以通过调整realsize改变这个值，
+		 从上面的分析可知arm64架构时没有zone_high内存分布的，所以不会进入这个循环
 		 */
 		memmap_pages = calc_memmap_size(size, realsize);
 		if (!is_highmem_idx(j)) {
@@ -6068,6 +6078,8 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat)
 		}
 
 		/* Account for reserved pages */
+         /*调整realsize的大小，即减去DMA保留页的大小
+         */
 		if (j == 0 && freesize > dma_reserve) {
 			freesize -= dma_reserve;
 			printk(KERN_DEBUG "  %s zone: %lu pages reserved\n",
@@ -6086,6 +6098,8 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat)
 		 * when the bootmem allocator frees pages into the buddy system.
 		 * And all highmem pages will be managed by the buddy system.
 		 */
+		/*managed_pages 被Buddy System管理的页面数量
+		 */
 		zone->managed_pages = is_highmem_idx(j) ? realsize : freesize;
 #ifdef CONFIG_NUMA
 		zone->node = nid;
@@ -6098,7 +6112,7 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat)
 
 		if (!size)
 			continue;
-
+        //完成最终的初始化
 		set_pageblock_order();
 		setup_usemap(pgdat, zone, zone_start_pfn, size);
 		init_currently_empty_zone(zone, zone_start_pfn, size);
@@ -6166,6 +6180,7 @@ void __paginginit free_area_init_node(int nid, unsigned long *zones_size,
 	pgdat->node_start_pfn = node_start_pfn;
 	pgdat->per_cpu_nodestats = NULL;
 #ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
+    /*获取Node 0的start页帧号，与结束的页帧号*/
 	get_pfn_range_for_nid(nid, &start_pfn, &end_pfn);
 	pr_info("Initmem setup node %d [mem %#018Lx-%#018Lx]\n", nid,
 		(u64)start_pfn << PAGE_SHIFT,
@@ -6173,9 +6188,11 @@ void __paginginit free_area_init_node(int nid, unsigned long *zones_size,
 #else
 	start_pfn = node_start_pfn;
 #endif
+    //通过start_pfn,end_pfn计算出zons_size的大小，通过这些信息就可以大致的建立起来node的内测结构
 	calculate_node_totalpages(pgdat, start_pfn, end_pfn,
 				  zones_size, zholes_size);
-
+    /*  分配了该节点的页面描述符数组
+     *  [pgdat->node_mem_map数组的内存分配  */
 	alloc_node_mem_map(pgdat);
 #ifdef CONFIG_FLAT_NODE_MEM_MAP
 	printk(KERN_DEBUG "free_area_init_node: node %d, pgdat %08lx, node_mem_map %08lx\n",
@@ -6184,6 +6201,7 @@ void __paginginit free_area_init_node(int nid, unsigned long *zones_size,
 #endif
 
 	reset_deferred_meminit(pgdat);
+    //完成node初始化的核心操作
 	free_area_init_core(pgdat);
 }
 
@@ -6547,9 +6565,12 @@ void __init free_area_init_nodes(unsigned long *max_zone_pfn)
 				sizeof(arch_zone_lowest_possible_pfn));
 	memset(arch_zone_highest_possible_pfn, 0,
 				sizeof(arch_zone_highest_possible_pfn));
-
+    
+    //找到内存当中最小的可用的页帧编号
 	start_pfn = find_min_pfn_with_active_regions();
-
+    /*通过对i的判断将对应的zone_dma,zone_normal的趋与边界填充到
+    arch_zone_lowest_possible_pfn全局变量当中，位后续初始化做铺垫
+    */
 	for (i = 0; i < MAX_NR_ZONES; i++) {
 		if (i == ZONE_MOVABLE)
 			continue;
@@ -6564,7 +6585,10 @@ void __init free_area_init_nodes(unsigned long *max_zone_pfn)
 	/* Find the PFNs that ZONE_MOVABLE begins at in each node */
 	memset(zone_movable_pfn, 0, sizeof(zone_movable_pfn));
 	find_zone_movable_pfns_for_nodes();
-
+    /*将各个区域的内存范围打印出来，这里有一点值得注意的是在arm64架构当中取消了
+    ZONE_HIGHMEM这一项，通过如果你给系统分配的内存小于4G时zone_normal就会lowest=highest
+    显示为空，但这不影响你后续内存的映射使用
+    */
 	/* Print out the zone ranges */
 	pr_info("Zone ranges:\n");
 	for (i = 0; i < MAX_NR_ZONES; i++) {
@@ -6591,6 +6615,9 @@ void __init free_area_init_nodes(unsigned long *max_zone_pfn)
 	}
 
 	/* Print out the early node map */
+	/*将早期的内存节点范围打印出来，
+	从这条打印当中我们就可以知道在ARM64为系统当中只有一个Node 0
+	*/
 	pr_info("Early memory node ranges\n");
 	for_each_mem_pfn_range(i, MAX_NUMNODES, &start_pfn, &end_pfn, &nid)
 		pr_info("  node %3d: [mem %#018Lx-%#018Lx]\n", nid,
@@ -6600,6 +6627,9 @@ void __init free_area_init_nodes(unsigned long *max_zone_pfn)
 	/* Initialise every node */
 	mminit_verify_pageflags_layout();
 	setup_nr_node_ids();
+    /*通过上面的打印可知只存在一个node0，所以该操作就是
+    通过free_area_init_node函数完成对Node 0的初始化操作
+    */
 	for_each_online_node(nid) {
 		pg_data_t *pgdat = NODE_DATA(nid);
 		free_area_init_node(nid, NULL,
