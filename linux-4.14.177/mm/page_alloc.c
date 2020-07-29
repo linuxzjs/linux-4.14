@@ -3092,11 +3092,14 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
 	 * Scan zonelist, looking for a zone with enough free.
 	 * See also __cpuset_node_allowed() comment in kernel/cpuset.c.
 	 */
+	 /*扫描查询zonelist 也就是zone_normal,zone_dma,zone_moval这三个zone类型，获取到
+	 足够的page，该过程是有一定的优先级的依次是dma, normal, moval
+	 */
 	for_next_zone_zonelist_nodemask(zone, z, ac->zonelist, ac->high_zoneidx,
 								ac->nodemask) {
 		struct page *page;
 		unsigned long mark;
-
+        //该zone区域不支持page分配所以continue 直接跳过该zone
 		if (cpusets_enabled() &&
 			(alloc_flags & ALLOC_CPUSET) &&
 			!__cpuset_zone_allowed(zone, gfp_mask))
@@ -3120,6 +3123,9 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
 		 * will require awareness of nodes in the
 		 * dirty-throttling and the flusher threads.
 		 */
+		 /*判断zone 区域的脏页是否已经超过了limit，如果超过limit则直接contine
+		 跳过zone区域
+		 */
 		if (ac->spread_dirty_pages) {
 			if (last_pgdat_dirty_limit == zone->zone_pgdat)
 				continue;
@@ -3129,7 +3135,9 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
 				continue;
 			}
 		}
-
+        /*对比内存的min,low,high对比判断内存是否足够，如果足够直接
+        跳转到try_this_zone当中进行buddy system内存分配
+        */
 		mark = zone->watermark[alloc_flags & ALLOC_WMARK_MASK];
 		if (!zone_watermark_fast(zone, order, mark,
 				       ac_classzone_idx(ac), alloc_flags)) {
@@ -3139,11 +3147,16 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
 			BUILD_BUG_ON(ALLOC_NO_WATERMARKS < NR_WMARK);
 			if (alloc_flags & ALLOC_NO_WATERMARKS)
 				goto try_this_zone;
-
+            /*进一步检测确认zone区域是否能够进行内存回收，如果不能直接contiune
+            跳过该zone区域，如果能够进行内存回收则进入node_reclaim进一步回收内存
+            */
 			if (node_reclaim_mode == 0 ||
 			    !zone_allows_reclaim(ac->preferred_zoneref->zone, zone))
 				continue;
-
+            
+            /*return 返回值为NODE_RECLAIM_NOSCAN，NODE_RECLAIM_FULL代表内存回收失败直接continue跳过
+            zone区域，如果回收成功则进入zone_watermark_ok判断内存是否够用
+            */
 			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order);
 			switch (ret) {
 			case NODE_RECLAIM_NOSCAN:
@@ -3154,6 +3167,8 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
 				continue;
 			default:
 				/* did we reclaim enough */
+                /*判断资源充足，则进入buddy system分配内存，如果失败则continue 跳过zone区域
+                */
 				if (zone_watermark_ok(zone, order, mark,
 						ac_classzone_idx(ac), alloc_flags))
 					goto try_this_zone;
@@ -3161,7 +3176,7 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
 				continue;
 			}
 		}
-
+        //buddy system核心操作如下
 try_this_zone:
 		page = rmqueue(ac->preferred_zoneref->zone, zone, order,
 				gfp_mask, alloc_flags, ac->migratetype);
@@ -4162,18 +4177,24 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 	 * There are several places where we assume that the order value is sane
 	 * so bail out early if the request is out of bound.
 	 */
+	 //确保order小于max order
 	if (unlikely(order >= MAX_ORDER)) {
 		WARN_ON_ONCE(!(gfp_mask & __GFP_NOWARN));
 		return NULL;
 	}
-
+    /*
+    将gfp_mask进行解析填充到alloc_context ac结构体当中，为下面的
+    地址分配做准备，相当于初始化了ac结构体，同时根据node mask确认 node zone
+    */
 	gfp_mask &= gfp_allowed_mask;
 	alloc_mask = gfp_mask;
 	if (!prepare_alloc_pages(gfp_mask, order, preferred_nid, nodemask, &ac, &alloc_mask, &alloc_flags))
 		return NULL;
 
 	finalise_ac(gfp_mask, order, &ac);
-
+    /*
+    fast path分配页面，如果成功获取页面，则直接return page
+    */
 	/* First allocation attempt */
 	page = get_page_from_freelist(alloc_mask, order, alloc_flags, &ac);
 	if (likely(page))
@@ -4194,9 +4215,10 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 	 */
 	if (unlikely(ac.nodemask != nodemask))
 		ac.nodemask = nodemask;
-
+    //slow path 分配page 该过程与 fast path 该过程是否缓慢，对cpu的损耗较大
 	page = __alloc_pages_slowpath(alloc_mask, order, &ac);
 
+    //判断该page是否合法，如果合法return page，如果不合法page = NULL alloc_pages失败
 out:
 	if (memcg_kmem_enabled() && (gfp_mask & __GFP_ACCOUNT) && page &&
 	    unlikely(memcg_kmem_charge(page, gfp_mask, order) != 0)) {
