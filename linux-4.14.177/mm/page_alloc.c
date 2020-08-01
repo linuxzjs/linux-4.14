@@ -3899,6 +3899,7 @@ retry_cpuset:
 	 * kswapd needs to be woken up, and to avoid the cost of setting up
 	 * alloc_flags precisely. So we do that now.
 	 */
+	 //使用gfp_mask掩码获取alloc_flag标志
 	alloc_flags = gfp_to_alloc_flags(gfp_mask);
 
 	/*
@@ -3907,11 +3908,17 @@ retry_cpuset:
 	 * there was a cpuset modification and we are retrying - otherwise we
 	 * could end up iterating over non-eligible zones endlessly.
 	 */
+	 /*重新获取填充nodemask,nodelist，去对ac结构体做类似的初始化操作，原因是
+	 在fast path当中ac的结构体内容可能已经被修改了，所以这里重新获取一次，如果这里
+	 获取失败则说明没有相应的zone可供使用则直接跳转到nopage路径。
+	 */
 	ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
 					ac->high_zoneidx, ac->nodemask);
 	if (!ac->preferred_zoneref->zone)
 		goto nopage;
 
+    /*如果为真此时唤醒kswapds进程，这个过程是异步的并不是直接获取，而是通过内存的交换释放出一定的内存出来
+    */
 	if (gfp_mask & __GFP_KSWAPD_RECLAIM)
 		wake_all_kswapds(order, ac);
 
@@ -3919,6 +3926,9 @@ retry_cpuset:
 	 * The adjusted alloc_flags might result in immediate success, so try
 	 * that first
 	 */
+	/*调整alloc_pages标志后尝试第一次分配内存，如果分配成功，则跳转到got_pg下，
+	这是一个fast path的过程，如果分配失败则继续向下执行
+	*/
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
 	if (page)
 		goto got_pg;
@@ -3931,6 +3941,11 @@ retry_cpuset:
 	 * same migratetype.
 	 * Don't try this for allocations that are allowed to ignore
 	 * watermarks, as the ALLOC_NO_WATERMARKS attempt didn't yet happen.
+	 */
+	 /*满足一下三点可以直接使用压缩内存，获得足够的page
+	 1.can_direct_reclaim允许直接回收内存;2.order合法且migratetype不能是可以移动内存MIGRATE_MOVABLE类型
+	 3.不能使用gfp_pfmemalloc_allowed通用分配方式。满足以上三个条件则直接使用__alloc_pages_direct_compact
+	 通过内存压缩分配获取page，如果获取内存失败则继续向下执行
 	 */
 	if (can_direct_reclaim &&
 			(costly_order ||
@@ -3947,6 +3962,8 @@ retry_cpuset:
 		 * Checks for costly allocations with __GFP_NORETRY, which
 		 * includes THP page fault allocations
 		 */
+		/*上面分配内存失败，gfp_mask 校验分配内存失败后不再重试
+        */
 		if (costly_order && (gfp_mask & __GFP_NORETRY)) {
 			/*
 			 * If compaction is deferred for high-order allocations,
@@ -3956,6 +3973,9 @@ retry_cpuset:
 			 * system, so we fail the allocation instead of entering
 			 * direct reclaim.
 			 */
+			/*如果压缩延迟到高阶分配，因为最近同步压缩失败。
+			如果在这种情况下，使用THP(Transparent Huge pages)分配，
+			为了不严重扰乱系统，所以我们分配失败而不是进入直接回收页面。*/
 			if (compact_result == COMPACT_DEFERRED)
 				goto nopage;
 
@@ -3964,15 +3984,18 @@ retry_cpuset:
 			 * sync compaction could be very expensive, so keep
 			 * using async compaction.
 			 */
+			/*在我们看来内存回收/压缩是值得尝试的，但是同步的压缩内存的方式回收
+            会给系统带来很大的压力，所以我们还是只用异步的方式压缩回收内存*/
 			compact_priority = INIT_COMPACT_PRIORITY;
 		}
 	}
 
 retry:
 	/* Ensure kswapd doesn't accidentally go to sleep as long as we loop */
+    //唤醒kswaped交换内存，并确保kswaped不会被意外休眠
 	if (gfp_mask & __GFP_KSWAPD_RECLAIM)
 		wake_all_kswapds(order, ac);
-
+    //重新的设置alloc_flags内存分配标志
 	reserve_flags = __gfp_pfmemalloc_flags(gfp_mask);
 	if (reserve_flags)
 		alloc_flags = reserve_flags;
@@ -3988,31 +4011,37 @@ retry:
 	}
 
 	/* Attempt with potentially adjusted zonelist and alloc_flags */
+    /*使用调整后的zonelist alloc_flags重新分配内存，这里可能就改变了watermask的水位线*/
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
 	if (page)
 		goto got_pg;
 
 	/* Caller is not willing to reclaim, we can't balance anything */
+    /*如果不能直接分配则进入Nopage,如果允许直接分配内存则继续向下执行*/
 	if (!can_direct_reclaim)
 		goto nopage;
 
 	/* Avoid recursion of direct reclaim */
+    /*避免直接回收造成的递归操作，如果是则进入nopage，如果不是则继续向下执行，直接分配内存*/
 	if (current->flags & PF_MEMALLOC)
 		goto nopage;
 
 	/* Try direct reclaim and then allocating */
+    /*直接分配内存，并分配page页面，如果失败跳转到nopage*/
 	page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
 							&did_some_progress);
 	if (page)
 		goto got_pg;
 
 	/* Try direct compaction and then allocating */
+    /*直接内存压缩方式回收内存，并分配page*/
 	page = __alloc_pages_direct_compact(gfp_mask, order, alloc_flags, ac,
 					compact_priority, &compact_result);
 	if (page)
 		goto got_pg;
 
 	/* Do not loop if specifically requested */
+    /*如果特别要求，不要循环*/
 	if (gfp_mask & __GFP_NORETRY)
 		goto nopage;
 
@@ -4022,7 +4051,7 @@ retry:
 	 */
 	if (costly_order && !(gfp_mask & __GFP_RETRY_MAYFAIL))
 		goto nopage;
-
+    /*判断需要retry重新分配内存*/
 	if (should_reclaim_retry(gfp_mask, order, ac, alloc_flags,
 				 did_some_progress > 0, &no_progress_loops))
 		goto retry;
@@ -4045,11 +4074,13 @@ retry:
 		goto retry_cpuset;
 
 	/* Reclaim has failed us, start killing things */
+    /*启动oom killer杀死某些进程，直接分配内存*/
 	page = __alloc_pages_may_oom(gfp_mask, order, ac, &did_some_progress);
 	if (page)
 		goto got_pg;
 
 	/* Avoid allocations with no watermarks from looping endlessly */
+    /*如果当前进程被oom killer跳转到no_page页面*/
 	if (tsk_is_oom_victim(current) &&
 	    (alloc_flags == ALLOC_OOM ||
 	     (gfp_mask & __GFP_NOMEMALLOC)))
@@ -4063,6 +4094,7 @@ retry:
 
 nopage:
 	/* Deal with possible cpuset update races before we fail */
+    /*在失败之前处理可能的cpuset更新竞争*/
 	if (check_retry_cpuset(cpuset_mems_cookie, ac))
 		goto retry_cpuset;
 
@@ -4099,6 +4131,7 @@ nopage:
 		 * could deplete whole memory reserves which would just make
 		 * the situation worse
 		 */
+		/*采用ALLOC_HARDER方式分配内存*/
 		page = __alloc_pages_cpuset_fallback(gfp_mask, order, ALLOC_HARDER, ac);
 		if (page)
 			goto got_pg;
