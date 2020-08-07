@@ -1651,9 +1651,12 @@ static inline void expand(struct zone *zone, struct page *page,
 	int low, int high, struct free_area *area,
 	int migratetype)
 {
+    /*size = 2^high 这个就是与free_area[order]对应连续2^order个page组成一个框*/
 	unsigned long size = 1 << high;
-
+    /*如果high>low 则将high对应的free_area[high]分配成两个free_area[high--]就是一个这样的过程*/
 	while (high > low) {
+        /*从high -> low area一次递减，high依次递减，
+        size = size/2将大块拆分成两块，将后半块重新放到伙伴系统中*/
 		area--;
 		high--;
 		size >>= 1;
@@ -1667,10 +1670,10 @@ static inline void expand(struct zone *zone, struct page *page,
 		 */
 		if (set_page_guard(zone, &page[size], high, migratetype))
 			continue;
-
+        /*将high大块拆分成两块，将后半块重新放到high-1的伙伴系统中*/
 		list_add(&page[size].lru, &area->free_list[migratetype]);
-		area->nr_free++;
-		set_page_order(&page[size], high);
+		area->nr_free++; //增加统计计数
+		set_page_order(&page[size], high); //设置当前page的order也就是页表的阶数
 	}
 }
 
@@ -1806,18 +1809,26 @@ struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
 	unsigned int current_order;
 	struct free_area *area;
 	struct page *page;
-
+    
 	/* Find a page of the appropriate size in the preferred list */
+    /*从指定阶到MAX_ORDER的伙伴链表中去查找迁移类型为migratetype的空闲页块
+      将当前zone->free_area[current_order]赋给area,在list_first_entry_or_null
+      中通过migratetype类型移动页面分配page*/
 	for (current_order = order; current_order < MAX_ORDER; ++current_order) {
 		area = &(zone->free_area[current_order]);
 		page = list_first_entry_or_null(&area->free_list[migratetype],
 							struct page, lru);
+        /*如果page 为空则continue取更大的order当中取分配内存，直到分配成功*/
 		if (!page)
 			continue;
-		list_del(&page->lru);
+		list_del(&page->lru);//将页块从对应阶的链表中删除
+        /*将分配出去的page 的order设置为0，相当于page已经分配成功*/
 		rmv_page_order(page);
-		area->nr_free--;
+		area->nr_free--;//对应阶的free_area中空闲页块计数减一
+		/*将current_order阶的页拆分成小块并重新放到对应的链表中去
+          这个过程就是一个一级一级的向下拆分的过程，与free过程相反*/
 		expand(zone, page, order, current_order, area, migratetype);
+        /*通过该函数将拆分后的page的index 设置页的迁移类型为page->index = migratetype*/
 		set_pcppage_migratetype(page, migratetype);
 		return page;
 	}
@@ -1994,16 +2005,20 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
 	struct free_area *area;
 	int free_pages, movable_pages, alike_pages;
 	int old_block_type;
-
+     //保存页块的迁移类型
 	old_block_type = get_pageblock_migratetype(page);
 
 	/*
 	 * This can happen due to races and we want to prevent broken
 	 * highatomic accounting.
 	 */
+	/* 如果页块是用于紧急内存分配的页（MIGRATE_HIGHATOMIC）就不能改变其迁移类型*/
 	if (is_migrate_highatomic(old_block_type))
 		goto single_page;
-
+    
+    /* 如果选定的current_order页块大于pageblock_order （MAX_ORDER – 1）就改变整页块的迁移类型，迁移类型设
+    置的大小为pageblock_order，所以这里需要用change_pageblock_range改变多个pageblock_order的
+    迁移类型*/
 	/* Take ownership for orders >= pageblock_order */
 	if (current_order >= pageblock_order) {
 		change_pageblock_range(page, current_order, start_type);
@@ -2011,9 +2026,11 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
 	}
 
 	/* We are not allowed to try stealing from the whole block */
+    /*参数whole_block 是前面函数find_suitable_fallback返回的，表示是否适合盗用整页块*/
 	if (!whole_block)
 		goto single_page;
-
+    
+    /*统计页块在伙伴系统中的页和不在伙伴系统中并且类型为MOVABLE的页数量并且删除在伙伴系统中的页*/
 	free_pages = move_freepages_block(zone, page, start_type,
 						&movable_pages);
 	/*
@@ -2021,6 +2038,7 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
 	 * For movable allocation, it's the number of movable pages which
 	 * we just obtained. For other types it's a bit more tricky.
 	 */
+    // alike_pages为与类型start_type兼容的页的数量
 	if (start_type == MIGRATE_MOVABLE) {
 		alike_pages = movable_pages;
 	} else {
@@ -2037,8 +2055,9 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
 		else
 			alike_pages = 0;
 	}
-
+    
 	/* moving whole block can fail due to zone boundary conditions */
+    //页块跨越了zone边界可能出现free_pages为0，这种情况不能改变页块的迁移类型
 	if (!free_pages)
 		goto single_page;
 
@@ -2046,14 +2065,19 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
 	 * If a sufficient number of pages in the block are either free or of
 	 * comparable migratability as our allocation, claim the whole block.
 	 */
+	 //如果空闲页和与我们分配类型兼容页数量大于整个页块的一半就改变整个页块的迁移类型
 	if (free_pages + alike_pages >= (1 << (pageblock_order-1)) ||
 			page_group_by_mobility_disabled)
+		//通过修改页块在zone-> pageblock_flags中对应bit来修改页块的迁移类型
 		set_pageblock_migratetype(page, start_type);
 
 	return;
 
 single_page:
 	area = &zone->free_area[current_order];
+    /*将页块从之前的迁移类型列表中移动到迁移类型为start_type的列表中，
+    然后返回到函数__rmqueue中，最终的将后备迁移类型转移到start_type的操作就是再这边完成
+    跳转到retry去尝试重新分配*/
 	list_move(&page->lru, &area->free_list[start_type]);
 }
 
@@ -2063,24 +2087,30 @@ single_page:
  * we can steal other freepages all together. This would help to reduce
  * fragmentation due to mixed migratetype pages in one pageblock.
  */
+ //注意这个函数只是找到合适的迁移类型，并没有做对应的迁移工作
 int find_suitable_fallback(struct free_area *area, unsigned int order,
 			int migratetype, bool only_stealable, bool *can_steal)
 {
 	int i;
 	int fallback_mt;
-
+    //order的列表中要有空闲页块，如果没有则直接返回
 	if (area->nr_free == 0)
 		return -1;
 
 	*can_steal = false;
 	for (i = 0;; i++) {
+        /*循环fallbacks获取后备迁移类型，如果是MIGRATE_TYPES，则说明再改后备后备类型已经全部检查完毕，直接break
+          跳出循环即可，比如说：[MIGRATE_UNMOVABLE]   = { MIGRATE_RECLAIMABLE, MIGRATE_MOVABLE,   MIGRATE_TYPES }当发现
+          fallback_mt == MIGRATE_TYPES直接跳出*/
 		fallback_mt = fallbacks[migratetype][i];
 		if (fallback_mt == MIGRATE_TYPES)
 			break;
-
+        /*判断当前迁移类型列表是否为空，如果不为空则向下执行，如果为空则continue去找这个后备迁移类型当中的其他类型*/
 		if (list_empty(&area->free_list[fallback_mt]))
 			continue;
-
+        /*判断是否可以迁移该页块，判断条件：1）order >= pageblock_order / 2；
+        2）迁移类型为 MIGRATE_RECLAIMABLE；
+        3）迁移类型为MIGRATE_UNMOVABLE*/
 		if (can_steal_fallback(order, migratetype))
 			*can_steal = true;
 
@@ -2238,12 +2268,15 @@ __rmqueue_fallback(struct zone *zone, int order, int start_migratetype)
 	 * approximates finding the pageblock with the most free pages, which
 	 * would be too costly to do exactly.
 	 */
+	/*尝试找到一个尽可能大的可用页块，这个currernt order是一阶一阶向下降的，直到找到合适的内存为止*/
 	for (current_order = MAX_ORDER - 1; current_order >= order;
 				--current_order) {
+        /*通过current_order取出当前zone 对应的free_area,放在后边使用*/
 		area = &(zone->free_area[current_order]);
+        /*外面循环指定current_order,下面函数循环取出fallbacks[migratetype][i]备用迁移类型，根据这两个信息尝试找出合适盗取页块，并返回迁移类型*/
 		fallback_mt = find_suitable_fallback(area, current_order,
 				start_migratetype, false, &can_steal);
-		if (fallback_mt == -1)
+		if (fallback_mt == -1)//如果在这一个order当中没有找到合适的迁移类型则continue查找下一个order
 			continue;
 
 		/*
@@ -2254,10 +2287,11 @@ __rmqueue_fallback(struct zone *zone, int order, int start_migratetype)
 		 * allocation falls back into a different pageblock than this
 		 * one, it won't cause permanent fragmentation.
 		 */
+		 /*如果满足一下条件则直接进入find_smallest查询对应fallback_mt*/
 		if (!can_steal && start_migratetype == MIGRATE_MOVABLE
 					&& current_order > order)
 			goto find_smallest;
-
+        //找到合适的迁移类型直接跳转到do_steal完成page的分配
 		goto do_steal;
 	}
 
@@ -2278,11 +2312,12 @@ find_smallest:
 	 * when looking for the largest page.
 	 */
 	VM_BUG_ON(current_order == MAX_ORDER);
-
+    
 do_steal:
 	page = list_first_entry(&area->free_list[fallback_mt],
 							struct page, lru);
-
+    
+    /*到这里已经找到合适的页块，下面函数判断是直接试迁移（改变整个页块的迁移类型），还是借用（分配但不改变页块迁移类型）*/
 	steal_suitable_fallback(zone, page, start_migratetype, can_steal);
 
 	trace_mm_page_alloc_extfrag(page, order, current_order,
@@ -2300,13 +2335,17 @@ static struct page *__rmqueue(struct zone *zone, unsigned int order,
 				int migratetype)
 {
 	struct page *page;
-
+    /*先使用__rmqueue_smallest分配page失败后再进行后续的分配*/
 retry:
 	page = __rmqueue_smallest(zone, order, migratetype);
 	if (unlikely(!page)) {
+        /*如果migratetype = MIGRATE_MOVABLE则执行__rmqueue_cma_fallback 从cma当中分配内存*/
 		if (migratetype == MIGRATE_MOVABLE)
 			page = __rmqueue_cma_fallback(zone, order);
-
+        /*如果类型migratetype != MIGRATE_MOVABLE则说明page此时为NULL，所以使用__rmqueue_fallback函数
+          将migratetype的后备类型中的page迁移到migratetype当中，比如说此时migratetype=MIGRATE_UNMOVABLE
+          则后备类型就是MIGRATE_RECLAIMABLE, MIGRATE_MOVABLE，后续就会提供__rmqueue_fallback函数将
+          MIGRATE_RECLAIMABLE, MIGRATE_MOVABLE的page迁移到MIGRATE_UNMOVABLE当中，在之后重新retry上去使用__rmqueue_smallest分配内存*/
 		if (!page && __rmqueue_fallback(zone, order, migratetype))
 			goto retry;
 	}
@@ -2756,7 +2795,8 @@ static struct page *__rmqueue_pcplist(struct zone *zone, int migratetype,
 			struct list_head *list)
 {
 	struct page *page;
-
+    /*如果list为空，则尝试从pcp->batch中分配对应的page 到list[migratetype]当中
+      如果list不为空则跳过这部分直接开始进行内存分配*/
 	do {
 		if (list_empty(list)) {
 			pcp->count += rmqueue_bulk(zone, 0,
@@ -2765,7 +2805,8 @@ static struct page *__rmqueue_pcplist(struct zone *zone, int migratetype,
 			if (unlikely(list_empty(list)))
 				return NULL;
 		}
-
+        /*如果上面的alloc_flags是__GFP_COLD则从list链表的头部取一个page,
+          如果不是clod则从链表的尾部取一个page*/
 		if (cold)
 			page = list_last_entry(list, struct page, lru);
 		else
@@ -2785,13 +2826,19 @@ static struct page *rmqueue_pcplist(struct zone *preferred_zone,
 {
 	struct per_cpu_pages *pcp;
 	struct list_head *list;
+    /*获取cold标志为判断释放为1 ，如果是则需要一个非缓存的冷页，
+    我的理解是没有建立页表页目录的page*/
 	bool cold = ((gfp_flags & __GFP_COLD) != 0);
 	struct page *page;
 	unsigned long flags;
 
 	local_irq_save(flags);
+    /*取出当前cpu的pcp并通过pcp->lists 获取lists的 page链表，这个与free_list链表有点相似
+    并通过migratetype类型判断出这个list的类型*/
 	pcp = &this_cpu_ptr(zone->pageset)->pcp;
 	list = &pcp->lists[migratetype];
+    /*此时调用__rmqueue_pcplist尝试分配相应的page，有一点疑问是此时不需要判断page是否为NULL？
+    */
 	page = __rmqueue_pcplist(zone,  migratetype, cold, pcp, list);
 	if (page) {
 		__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
@@ -2812,7 +2859,8 @@ struct page *rmqueue(struct zone *preferred_zone,
 {
 	unsigned long flags;
 	struct page *page;
-
+    /*当order == 0 时从pcp中分配page pcp 指的是 per cpu
+    分配page成功 则跳转到out， return page*/
 	if (likely(order == 0)) {
 		page = rmqueue_pcplist(preferred_zone, zone, order,
 				gfp_flags, migratetype);
@@ -2825,7 +2873,8 @@ struct page *rmqueue(struct zone *preferred_zone,
 	 */
 	WARN_ON_ONCE((gfp_flags & __GFP_NOFAIL) && (order > 1));
 	spin_lock_irqsave(&zone->lock, flags);
-
+    /*如果alloc_flags & ALLOC_HARDER 为真，则直接从__rmqueue_smallest分配page，该函数的核心就是expand
+      如果__rmqueue_smallest 分配失败则进入__rmqueue分配，该函数时常规也就是普通的分配方式*/
 	do {
 		page = NULL;
 		if (alloc_flags & ALLOC_HARDER) {
