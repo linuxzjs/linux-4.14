@@ -834,7 +834,7 @@ continue_merging:
 		buddy_pfn = __find_buddy_pfn(pfn, order);
         /*如果page_pfn的1 << order位为1，buddy_pfn与page_pfn相减的结果就是负的(1 << order);
         如果page_pfn的1 << order位为0，相减的结果就为正的(1 << order)。Buddy是page的伙伴页。
-        以当前页帧实例page为基准，向左或向右偏移(1 << order)。*/*/
+        以当前页帧实例page为基准，向左或向右偏移(1 << order)。*/
 		buddy = page + (buddy_pfn - pfn);
     
         /*函数page_is_buddy主要做四项检查：伙伴页是否处于一个空洞中、伙伴页是否在伙伴系统中
