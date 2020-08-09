@@ -813,7 +813,8 @@ static inline void __free_one_page(struct page *page,
 	unsigned long uninitialized_var(buddy_pfn);
 	struct page *buddy;
 	unsigned int max_order;
-
+    
+    //计算出最大的order
 	max_order = min_t(unsigned int, MAX_ORDER, pageblock_order + 1);
 
 	VM_BUG_ON(!zone_is_initialized(zone));
@@ -825,12 +826,19 @@ static inline void __free_one_page(struct page *page,
 
 	VM_BUG_ON_PAGE(pfn & ((1 << order) - 1), page);
 	VM_BUG_ON_PAGE(bad_range(zone, page), page);
-
+    /*首先从同order查找，能合并的话，进一步往高一阶order查找
+    */
 continue_merging:
 	while (order < max_order - 1) {
+        /*__find_buddy_pfn就一行代码page_pfn ^ (1 << order)，将page_pfn的1 << order位取反*/
 		buddy_pfn = __find_buddy_pfn(pfn, order);
+        /*如果page_pfn的1 << order位为1，buddy_pfn与page_pfn相减的结果就是负的(1 << order);
+        如果page_pfn的1 << order位为0，相减的结果就为正的(1 << order)。Buddy是page的伙伴页。
+        以当前页帧实例page为基准，向左或向右偏移(1 << order)。*/*/
 		buddy = page + (buddy_pfn - pfn);
-
+    
+        /*函数page_is_buddy主要做四项检查：伙伴页是否处于一个空洞中、伙伴页是否在伙伴系统中
+       、page和它的伙伴页是否有相同的阶、page和它的伙伴页是否处于相同的内存域中*/
 		if (!pfn_valid_within(buddy_pfn))
 			goto done_merging;
 		if (!page_is_buddy(page, buddy, order))
@@ -843,13 +851,16 @@ continue_merging:
 			clear_page_guard(zone, buddy, order, migratetype);
 		} else {
 			list_del(&buddy->lru);
-			zone->free_area[order].nr_free--;
-			rmv_page_order(buddy);
+			zone->free_area[order].nr_free--;//递减该阶中的页计数
+			rmv_page_order(buddy);//清除页的“在伙伴系统中”的标志，然后将页块的阶数page->private置为0
 		}
+        
+        //将page_idx的1 << order位清零
 		combined_pfn = buddy_pfn & pfn;
+        //求order+1阶页块的首页
 		page = page + (combined_pfn - pfn);
-		pfn = combined_pfn;
-		order++;
+		pfn = combined_pfn; //设置新的order
+		order++;//阶数递增
 	}
 	if (max_order < MAX_ORDER) {
 		/* If we are here, it means order is >= pageblock_order.
@@ -877,7 +888,7 @@ continue_merging:
 	}
 
 done_merging:
-	set_page_order(page, order);
+	set_page_order(page, order);//重新设定这块内存order
 
 	/*
 	 * If this is not the largest possible page, check if the buddy
@@ -887,12 +898,17 @@ done_merging:
 	 * so it's less likely to be used soon and more likely to be merged
 	 * as a higher order page
 	 */
+    /*在order阶向order+1阶的页块合并中失败了，
+    下面是判断如果下次order阶向order+1阶的页块合并能够成功的话，就将order阶页块链接到列表的末尾，
+    避免下次被分配出去，以便以后合并为更高阶的页块。*/ 
 	if ((order < MAX_ORDER-2) && pfn_valid_within(buddy_pfn)) {
 		struct page *higher_page, *higher_buddy;
-		combined_pfn = buddy_pfn & pfn;
-		higher_page = page + (combined_pfn - pfn);
+		combined_pfn = buddy_pfn & pfn;//求高一阶的页块首页
+		higher_page = page + (combined_pfn - pfn); 
+        //找出高一阶页块的伙伴页
 		buddy_pfn = __find_buddy_pfn(combined_pfn, order + 1);
 		higher_buddy = higher_page + (buddy_pfn - combined_pfn);
+        //检查高一阶页是否可以合并，如果可以合并就将order阶页链接到列表尾
 		if (pfn_valid_within(buddy_pfn) &&
 		    page_is_buddy(higher_page, higher_buddy, order + 1)) {
 			list_add_tail(&page->lru,
@@ -900,10 +916,11 @@ done_merging:
 			goto out;
 		}
 	}
-
+    
+    //如果高一阶页不可合并就将页块链接到列表首
 	list_add(&page->lru, &zone->free_area[order].free_list[migratetype]);
 out:
-	zone->free_area[order].nr_free++;
+	zone->free_area[order].nr_free++;//增加对应阶的空闲页计数
 }
 
 /*
@@ -1113,7 +1130,10 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 
 	spin_lock(&zone->lock);
 	isolated_pageblocks = has_isolate_pageblock(zone);
-
+    
+    /*per cpu lists中根据迁移类型的不同有多个链表，要释放一批到伙伴系统中去，
+    具体释放哪个链表中的需要做个权衡。这里的思路是越靠后的,释放的页越多，
+    依次比前一个链表多1, 这样循环选取直到释放够pcp->batch个页*/
 	while (count) {
 		struct page *page;
 		struct list_head *list;
@@ -1125,6 +1145,10 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 		 * off fuller lists instead of spinning excessively around empty
 		 * lists
 		 */
+		 /*通过migratetype选定要释放的链表，确定需要释放的页数batch_free
+           migratetype是从0开始依次是	MIGRATE_UNMOVABLE,MIGRATE_MOVABLE,
+	       MIGRATE_RECLAIMABLE如果等于MIGRATE_PCPTYPES则migratetype=0重新开始
+	       通过判断是否为空找到需要释放的pcp list*/
 		do {
 			batch_free++;
 			if (++migratetype == MIGRATE_PCPTYPES)
@@ -1135,7 +1159,8 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 		/* This is the only non-empty list. Free them all. */
 		if (batch_free == MIGRATE_PCPTYPES)
 			batch_free = count;
-
+        
+        /*从选定链表循环释放batch_free个页，这个是一个循环操作的过程将释放的page做迁移*/
 		do {
 			int mt;	/* migratetype of the to-be-freed page */
 
@@ -1152,7 +1177,7 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 
 			if (bulkfree_pcp_prepare(page))
 				continue;
-
+            //释放一页到伙伴系统，free_pages的核心函数
 			__free_one_page(page, page_to_pfn(page), zone, 0, mt);
 			trace_mm_page_pcpu_drain(page, 0, mt);
 		} while (--count && --batch_free && !list_empty(list));
@@ -2638,15 +2663,18 @@ void mark_free_pages(struct zone *zone)
  */
 void free_hot_cold_page(struct page *page, bool cold)
 {
+    //获取当前page所属的zone
 	struct zone *zone = page_zone(page);
 	struct per_cpu_pages *pcp;
 	unsigned long flags;
 	unsigned long pfn = page_to_pfn(page);
 	int migratetype;
-
+    
+    /*check page是否能够正常释放，如果不能则直接return*/
 	if (!free_pcp_prepare(page))
 		return;
-
+    
+    /*获取可释放page的migratetype类型*/
 	migratetype = get_pfnblock_migratetype(page, pfn);
 	set_pcppage_migratetype(page, migratetype);
 	local_irq_save(flags);
@@ -2659,6 +2687,10 @@ void free_hot_cold_page(struct page *page, bool cold)
 	 * areas back if necessary. Otherwise, we may have to free
 	 * excessively into the page allocator
 	 */
+	 /*只有不可移动页、可回收页和可移动页才能放到每CPU页框高速缓存中
+      如果迁移类型不属于这三种，则要将该页释放回伙伴系统。如果migratetype >= MIGRATE_PCPTYPES
+      则进一步判断类型释放为MIGRATE_ISOLATE类型，如果是则进入free_one_page释放这个page,如果不是则
+      修改migrate type为MIGRATE_MOVABLE进一步向下执行，这里有一个疑问就是为什么要修改类型为MIGRATE_MOVABLE*/
 	if (migratetype >= MIGRATE_PCPTYPES) {
 		if (unlikely(is_migrate_isolate(migratetype))) {
 			free_one_page(zone, page, pfn, 0, migratetype);
@@ -2666,13 +2698,16 @@ void free_hot_cold_page(struct page *page, bool cold)
 		}
 		migratetype = MIGRATE_MOVABLE;
 	}
-
+    /*获取该cpu 上的pcp,如果是cold页面则从链表的头部取page，如果是不是cold也就是hot则从尾部开始*/
 	pcp = &this_cpu_ptr(zone->pageset)->pcp;
 	if (!cold)
 		list_add(&page->lru, &pcp->lists[migratetype]);
 	else
 		list_add_tail(&page->lru, &pcp->lists[migratetype]);
 	pcp->count++;
+    
+    /*每cpu中的页框数高于最大值时，就调用free_pcppages_bulk
+    释放batch个页框到伙伴系统*/
 	if (pcp->count >= pcp->high) {
 		unsigned long batch = READ_ONCE(pcp->batch);
 		free_pcppages_bulk(zone, batch, pcp);
