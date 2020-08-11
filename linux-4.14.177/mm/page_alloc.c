@@ -3027,13 +3027,16 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 			 int classzone_idx, unsigned int alloc_flags,
 			 long free_pages)
 {
-	long min = mark;
+	long min = mark; // 既然是检查是否满足mark要求，先将最小值设置为mark
 	int o;
+    /*通过alloc_flags获取alloc_harderc 信息，为后续判断做准备*/
 	const bool alloc_harder = (alloc_flags & (ALLOC_HARDER|ALLOC_OOM));
 
 	/* free_pages may go negative - that's OK */
+    /*free_ages = free_pages - 2^order -1 为什么要这样做，不明白？*/
 	free_pages -= (1 << order) - 1;
 
+    /* 如果需求比较迫切，就放宽些限制*/
 	if (alloc_flags & ALLOC_HIGH)
 		min -= min / 2;
 
@@ -3042,6 +3045,7 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 	 * the high-atomic reserves. This will over-estimate the size of the
 	 * atomic reserve but it avoids a search.
 	 */
+	/* 若未设置ALLOC_HARDER，则需要保留z->nr_reserved_highatomic内存以不时之需 */
 	if (likely(!alloc_harder)) {
 		free_pages -= z->nr_reserved_highatomic;
 	} else {
@@ -3051,6 +3055,8 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 		 * the exit path shortly and free memory. Any allocation it
 		 * makes during the free path will be small and short-lived.
 		 */
+		/*如果设置ALLOC_OOM说明分配内存十分迫切，所以降低启动OOM的要求，同时也明一点就是
+        OOM比ALLOC_HARDER更加的迫切*/
 		if (alloc_flags & ALLOC_OOM)
 			min -= min / 2;
 		else
@@ -3059,7 +3065,8 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 
 
 #ifdef CONFIG_CMA
-	/* If allocation can't use CMA areas don't use free CMA pages */
+	/* If allocation can't use CMA areas don't use free CMA pages */      
+    /* 如果配置了CMA，则没有明确指明从CMA分配时(即没有设置ALLOC_CMA)需要保留出CMA内存 */
 	if (!(alloc_flags & ALLOC_CMA))
 		free_pages -= zone_page_state(z, NR_FREE_CMA_PAGES);
 #endif
@@ -3069,6 +3076,8 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 	 * are not met, then a high-order request also cannot go ahead
 	 * even if a suitable page happened to be free.
 	 */
+	/*调整后的水位线，min + zone的保留区域的总和做比较，如果free_pages小于这个数值
+      说明无法正常分配page*/
 	if (free_pages <= min + z->lowmem_reserve[classzone_idx])
 		return false;
 
@@ -3077,6 +3086,7 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 		return true;
 
 	/* For a high-order request, check at least one suitable page is free */
+    /*在order当中查找满足分配要求的page,这里存在一个疑问就是free_pages如何与free_area关联起来的？*/
 	for (o = order; o < MAX_ORDER; o++) {
 		struct free_area *area = &z->free_area[o];
 		int mt;
@@ -4606,7 +4616,8 @@ static unsigned long nr_free_zone_pages(int offset)
 	unsigned long sum = 0;
 
 	struct zonelist *zonelist = node_zonelist(numa_node_id(), GFP_KERNEL);
-
+    /*获取每个zone的空闲pages，累加获得sum，这个
+    sum = managed_pages(buddy system管理的page) - high_pages(高水位的pages)*/
 	for_each_zone_zonelist(zone, z, zonelist, offset) {
 		unsigned long size = zone->managed_pages;
 		unsigned long high = high_wmark_pages(zone);
@@ -6988,22 +6999,24 @@ static void calculate_totalreserve_pages(void)
 	struct pglist_data *pgdat;
 	unsigned long reserve_pages = 0;
 	enum zone_type i, j;
-
+    /*遍历所有的Node 对于ARM64来说只有一个Node 0*/
 	for_each_online_pgdat(pgdat) {
 
 		pgdat->totalreserve_pages = 0;
-
+        /*遍历每个zone,依次是ZONE_DMA,ZONE_NORMAL,ZONE_MOVABLE*/
 		for (i = 0; i < MAX_NR_ZONES; i++) {
 			struct zone *zone = pgdat->node_zones + i;
 			long max = 0;
 
 			/* Find valid and maximum lowmem_reserve in the zone */
+            //查找当前zone中，为上级zone内存类型最大的保留值
 			for (j = i; j < MAX_NR_ZONES; j++) {
 				if (zone->lowmem_reserve[j] > max)
 					max = zone->lowmem_reserve[j];
 			}
 
 			/* we treat the high watermark as reserved pages. */
+            //每个zone的high水位值和最大保留值之和当做是系统运行保留阈值
 			max += high_wmark_pages(zone);
 
 			if (max > zone->managed_pages)
@@ -7014,6 +7027,7 @@ static void calculate_totalreserve_pages(void)
 			reserve_pages += max;
 		}
 	}
+     //这个totalreserve_pages在overcommit时会使用到,该值作为系统正常运行的最低保证
 	totalreserve_pages = reserve_pages;
 }
 
@@ -7027,16 +7041,27 @@ static void setup_per_zone_lowmem_reserve(void)
 {
 	struct pglist_data *pgdat;
 	enum zone_type j, idx;
-
+    /*遍历所有的Node 对于ARM64来说只有一个Node 0*/
 	for_each_online_pgdat(pgdat) {
+	    /*遍历每个zone,依次是ZONE_DMA,ZONE_NORMAL,ZONE_MOVABLE*/
 		for (j = 0; j < MAX_NR_ZONES; j++) {
 			struct zone *zone = pgdat->node_zones + j;
 			unsigned long managed_pages = zone->managed_pages;
 
 			zone->lowmem_reserve[j] = 0;
-
+ 
 			idx = j;
 			while (idx) {
+            /*当j=0时，ZONE_DMA区域zone[DMA].lowmem_reserve[DMA]=0;
+              当j=1时，ZONE_NORMAL区域
+                       当idx=0时 lower_zone=ZONE_DMA    
+                                 zone[DMA].lowmem_reserve[NORMAL] = zone[NORMAL].managed_pages/sysctl_lowmem_reserve_ratio[DMA]
+              当j=2时    ZONE_MOVABLE区域
+                       当idx=1时 lower_zone=ZONE_NORMAL 
+                                 zone[NORMAL].lowmem_reserve[MOVABLE] = zone[NORMAL].managed_pages/sysctl_lowmem_reserve_ratio[NORMAL]
+                       当idx=0时 lower_zone=ZONE_DMA    
+                                 zone[DMA].lowmem_reserve[MOVABLE] = zone[NORMAL + MOVABLE].managed_pages/sysctl_lowmem_reserve_ratio[DMA]
+            */
 				struct zone *lower_zone;
 
 				idx--;
@@ -7064,6 +7089,8 @@ static void __setup_per_zone_wmarks(void)
 	unsigned long flags;
 
 	/* Calculate total number of !ZONE_HIGHMEM pages */
+    /*ZONE_DMA managed_pages 加上 ZONE_NORMAL managed_pages得到lowmem_pages
+     在64为系统当中是没有ZONE_HIGH的，所以使用is_highmem将ZONE_HIGH排除在外*/
 	for_each_zone(zone) {
 		if (!is_highmem(zone))
 			lowmem_pages += zone->managed_pages;
@@ -7073,8 +7100,10 @@ static void __setup_per_zone_wmarks(void)
 		u64 tmp;
 
 		spin_lock_irqsave(&zone->lock, flags);
+        /*min_free_kbytes/4*(zone[DMA].managed_pages + zone[NORMAL].managed_pages)*/
 		tmp = (u64)pages_min * zone->managed_pages;
 		do_div(tmp, lowmem_pages);
+        //64位系统当中不存在ZONE_HIGH,所以直接跳转到else路径下
 		if (is_highmem(zone)) {
 			/*
 			 * __GFP_HIGH and PF_MEMALLOC allocations usually don't
@@ -7103,6 +7132,18 @@ static void __setup_per_zone_wmarks(void)
 		 * scale factor in proportion to available memory, but
 		 * ensure a minimum size on small systems.
 		 */
+		/*这部分代码体现出了min,low,high这三者之间的关联了，通过这部分代码就计算出每个zone的三个水位值，
+		  在常规情况下如果tmp >> 2大于mult_frac(zone->managed_pages,watermark_scale_factor, 10000)就会得出如下结论：
+		  zone->watermark[WMARK_MIN] = zone->watermark[WMARK_MIN]
+		  zone->watermark[WMARK_LOW] = zone->watermark[WMARK_MIN] + zone->watermark[WMARK_MIN]/4
+		  zone->watermark[WMARK_HIGH] = zone->watermark[WMARK_MIN] + zone->watermark[WMARK_MIN]/2
+		  这样这三个参数之间就存在了一定的比例：min:low:high = 1:1.25:1.5。在旧的代码体系当中就是一个这样的关系
+		  但是存在一个问题就是：这三个参数之间的差值太小，如果页面回收效果不好就会其启动直接内存回收模式(Direct-reclaim)
+		  这样就会对系统造成较大的系统负载，所以使用max_t选择最大的值这样就可以加大min，low,high之间的差值，这样就减小了
+		  直接内存内存的可能性，提高系统系能
+		  另外tmp>>2就相当于tmp/4 就与lowmem_kbytes = nr_free_buffer_pages() * (PAGE_SIZE >> 10)将lowmem_kbytes转变成了
+		  lowmem_pages计量单位由kbytes变成了page
+        */
 		tmp = max_t(u64, tmp >> 2,
 			    mult_frac(zone->managed_pages,
 				      watermark_scale_factor, 10000));
@@ -7114,6 +7155,7 @@ static void __setup_per_zone_wmarks(void)
 	}
 
 	/* update totalreserve_pages */
+    /*计算更新reserve pages的总和*/
 	calculate_totalreserve_pages();
 }
 
@@ -7161,22 +7203,30 @@ int __meminit init_per_zone_wmark_min(void)
 {
 	unsigned long lowmem_kbytes;
 	int new_min_free_kbytes;
-
+    
+    /*获取系统空闲内存值，扣除每个zone中managed_pages扣除high水位值后的总和
+    lowmem_kbytes = sum *4 单位是kbytes 就是有sum个page每个page站4个bit,总和就是lowmem_kbytes
+    */
 	lowmem_kbytes = nr_free_buffer_pages() * (PAGE_SIZE >> 10);
+    /*new_min_free_kbytes = sqrt(lowmem_kbytes * 16) = √(lowmem_kbytes * 16)开一个根号*/
 	new_min_free_kbytes = int_sqrt(lowmem_kbytes * 16);
 
 	if (new_min_free_kbytes > user_min_free_kbytes) {
 		min_free_kbytes = new_min_free_kbytes;
+        //最小128k
 		if (min_free_kbytes < 128)
 			min_free_kbytes = 128;
+        //最大64M
 		if (min_free_kbytes > 65536)
 			min_free_kbytes = 65536;
 	} else {
 		pr_warn("min_free_kbytes is not updated to %d because user defined value %d is preferred\n",
 				new_min_free_kbytes, user_min_free_kbytes);
 	}
+    //设置每个zone的min low high水位值
 	setup_per_zone_wmarks();
 	refresh_zone_stat_thresholds();
+    //设置每个zone为其他zone的保留内存
 	setup_per_zone_lowmem_reserve();
 
 #ifdef CONFIG_NUMA
