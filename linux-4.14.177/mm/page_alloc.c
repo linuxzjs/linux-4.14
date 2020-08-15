@@ -3027,7 +3027,7 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 			 int classzone_idx, unsigned int alloc_flags,
 			 long free_pages)
 {
-	long min = mark; // 既然是检查是否满足mark要求，先将最小值设置为mark
+	long min = mark; // 既然是检查是否满足mark要求，先将最小值设置为mark，这个mark大概率是zone_watermark[min]
 	int o;
     /*通过alloc_flags获取alloc_harderc 信息，为后续判断做准备*/
 	const bool alloc_harder = (alloc_flags & (ALLOC_HARDER|ALLOC_OOM));
@@ -3086,14 +3086,16 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 		return true;
 
 	/* For a high-order request, check at least one suitable page is free */
-    /*在order当中查找满足分配要求的page,这里存在一个疑问就是free_pages如何与free_area关联起来的？*/
+    /*在order当中查找满足分配要求的page,*/
 	for (o = order; o < MAX_ORDER; o++) {
 		struct free_area *area = &z->free_area[o];
 		int mt;
 
 		if (!area->nr_free)
 			continue;
-
+        /*在当前order下，找到满足要求不为空的free_list说明有足够的内存可供分配，return true
+        如果没有则在当前order当中从	MIGRATE_UNMOVABLE,MIGRATE_MOVABLE,MIGRATE_RECLAIMABLE依次轮询
+        取查找对应的空间，如果失败则继续向下执行，尝试从cma当中查找，*/
 		for (mt = 0; mt < MIGRATE_PCPTYPES; mt++) {
 			if (!list_empty(&area->free_list[mt]))
 				return true;
@@ -3122,6 +3124,7 @@ bool zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 		unsigned long mark, int classzone_idx, unsigned int alloc_flags)
 {
+    /*获取当前zone的free_pages  */
 	long free_pages = zone_page_state(z, NR_FREE_PAGES);
 	long cma_pages = 0;
 
@@ -3138,6 +3141,7 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 	 * the caller is !atomic then it'll uselessly search the free
 	 * list. That corner case is then slower but it is harmless.
 	 */
+	/*为什么当order ==     0的条件先直接return true*/
 	if (!order && (free_pages - cma_pages) > mark + z->lowmem_reserve[classzone_idx])
 		return true;
 
