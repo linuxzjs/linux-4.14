@@ -3474,6 +3474,7 @@ static void set_cpu_partial(struct kmem_cache *s)
 static int calculate_sizes(struct kmem_cache *s, int forced_order)
 {
 	unsigned long flags = s->flags;
+    //将slub 类型的sizeof值赋给size
 	size_t size = s->object_size;
 	int order;
 
@@ -3482,6 +3483,7 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 	 * place the free pointer at word boundaries and this determines
 	 * the possible location of the free pointer.
 	 */
+	  //先将size按照字长进行对齐,以便访问空闲指针
 	size = ALIGN(size, sizeof(void *));
 
 #ifdef CONFIG_SLUB_DEBUG
@@ -3510,6 +3512,7 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 	 * With that we have determined the number of bytes in actual use
 	 * by the object. This is the potential offset to the free pointer.
 	 */
+	 //将inuse设置为size
 	s->inuse = size;
 
 	if (((flags & (SLAB_TYPESAFE_BY_RCU | SLAB_POISON)) ||
@@ -3522,6 +3525,7 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 		 * This is the case if we do RCU, have a constructor or
 		 * destructor or are poisoning the objects.
 		 */
+		 /*将offset设置为size，这样对象的后面就用来存放下一个空闲对象的指针*/
 		s->offset = size;
 		size += sizeof(void *);
 	}
@@ -3558,17 +3562,22 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 	 * offset 0. In order to align the objects we have to simply size
 	 * each object to conform to the alignment.
 	 */
+	 /*根据计算出的对齐值重新进行对齐*/
 	size = ALIGN(size, s->align);
 	s->size = size;
+    /*如果指定了分配页面的阶数也就是buddy system当中的order的话则将其作为缓存的页面分配阶数
+    如果没有指定order,则通过根据size计算得出*/
 	if (forced_order >= 0)
 		order = forced_order;
 	else
 		order = calculate_order(size, s->reserved);
-
+    
+    //如果order < 0则直接return 0；
 	if (order < 0)
 		return 0;
 
 	s->allocflags = 0;
+    //设置分配内存的属性或者是内存分配的类型。
 	if (order)
 		s->allocflags |= __GFP_COMP;
 
@@ -3581,7 +3590,9 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 	/*
 	 * Determine the number of objects per slab
 	 */
+	 /*用oo保存slab的页框阶数和对象数*/
 	s->oo = oo_make(order, size, s->reserved);
+	/*min保存了slab只有一个对象时对应的order和此时可以存放的对象数*/
 	s->min = oo_make(get_order(size), size, s->reserved);
 	if (oo_objects(s->oo) > oo_objects(s->max))
 		s->max = s->oo;
@@ -3591,6 +3602,7 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 
 static int kmem_cache_open(struct kmem_cache *s, unsigned long flags)
 {
+    /*获取s的类型*/
 	s->flags = kmem_cache_flags(s->size, flags, s->name, s->ctor);
 	s->reserved = 0;
 #ifdef CONFIG_SLAB_FREELIST_HARDENED
@@ -3599,7 +3611,7 @@ static int kmem_cache_open(struct kmem_cache *s, unsigned long flags)
 
 	if (need_reserve_slab_rcu && (s->flags & SLAB_TYPESAFE_BY_RCU))
 		s->reserved = sizeof(struct rcu_head);
-
+    /*计算与order, object_size大小相关的各项数值*/
 	if (!calculate_sizes(s, -1))
 		goto error;
 	if (disable_higher_order_debug) {
@@ -4244,16 +4256,19 @@ __kmem_cache_alias(const char *name, size_t size, size_t align,
 		   unsigned long flags, void (*ctor)(void *))
 {
 	struct kmem_cache *s, *c;
-
+    /*如果找到则直接复用，*/
 	s = find_mergeable(size, align, flags, name, ctor);
 	if (s) {
+        /*缓存的引用计数加1，表示缓存中多了一种对象*/
 		s->refcount++;
 
 		/*
 		 * Adjust the object sizes so that we clear
 		 * the complete object on kzalloc.
 		 */
+        /*在新对象大小和原有对象大小中取较大者作为缓存的对象大小*/
 		s->object_size = max(s->object_size, (int)size);
+        /*同样对比新的inuse与原有slub inuse，取大的那个*/
 		s->inuse = max_t(int, s->inuse, ALIGN(size, sizeof(void *)));
 
 		for_each_memcg_cache(c, s) {

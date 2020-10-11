@@ -294,13 +294,15 @@ struct kmem_cache *find_mergeable(size_t size, size_t align,
 		unsigned long flags, const char *name, void (*ctor)(void *))
 {
 	struct kmem_cache *s;
-
+    /*设置了slub_nomerge或待创建的缓存的标识位中标明了不进行复用，则不查找复用缓存*/
 	if (slab_nomerge)
 		return NULL;
-
+    
+    /*待创建缓存指定了构造函数，则不查找复用缓存*/
 	if (ctor)
 		return NULL;
 
+	/*确定待创建缓存的各个属性*/
 	size = ALIGN(size, sizeof(void *));
 	align = calculate_alignment(flags, align, size);
 	size = ALIGN(size, align);
@@ -309,29 +311,36 @@ struct kmem_cache *find_mergeable(size_t size, size_t align,
 	if (flags & SLAB_NEVER_MERGE)
 		return NULL;
 
+   	/*遍历slab_root_caches其实就是遍历slab_caches中的缓存*/ 
 	list_for_each_entry_reverse(s, &slab_root_caches, root_caches_node) {
+	     /*缓存不允许复用则放弃该缓存*/
 		if (slab_unmergeable(s))
 			continue;
-
+        
+        /*原有缓存的对象占用内存的size小于要求的size，则放弃该缓存，这里需要注意一点这个判断的标准是size,而不是object_size*/
 		if (size > s->size)
 			continue;
-
+        
+        /*该slub cache flag 相关标识不一致，且原有slub flag不允许合并，放弃该缓存*/
 		if ((flags & SLAB_MERGE_SAME) != (s->flags & SLAB_MERGE_SAME))
 			continue;
 		/*
 		 * Check if alignment is compatible.
 		 * Courtesy of Adrian Drzewiecki
 		 */
+		 /*缓存给对象分配的内存大小和对齐值不相符，则放弃该缓存*/
 		if ((s->size & ~(align - 1)) != s->size)
 			continue;
-
+        
+        /*缓存给对象分配的内存大小比指定的size要多出1个字长以上，则放弃该缓存*/
 		if (s->size - size >= sizeof(void *))
 			continue;
 
 		if (IS_ENABLED(CONFIG_SLAB) && align &&
 			(align > s->align || s->align % align))
 			continue;
-
+        
+        //以上条件都不满足则表示找到了符合条件的缓存，可以进行复用，返回之
 		return s;
 	}
 	return NULL;
@@ -373,25 +382,28 @@ static struct kmem_cache *create_cache(const char *name,
 	int err;
 
 	err = -ENOMEM;
+    /*分配一个kmem_cache对象，这点就是后续slub内存分配当中的操作，这里不深究，再后边会做详细分析*/
 	s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
 	if (!s)
 		goto out;
-
+    
+    /*kmem_cache 结构体初始化*/
 	s->name = name;
 	s->object_size = object_size;
 	s->size = size;
 	s->align = align;
 	s->ctor = ctor;
-
 	err = init_memcg_params(s, memcg, root_cache);
 	if (err)
 		goto out_free_cache;
-
+    
+    /*创建一个slub缓存*/
 	err = __kmem_cache_create(s, flags);
 	if (err)
 		goto out_free_cache;
-
-	s->refcount = 1;
+    
+	s->refcount = 1;//此时只使用第一个object所以此处置1
+    //将缓存添加到slab_caches中，及创建成功
 	list_add(&s->list, &slab_caches);
 	memcg_link_cache(s);
 out:
@@ -461,17 +473,20 @@ kmem_cache_create(const char *name, size_t size, size_t align,
 	 * passed flags.
 	 */
 	flags &= CACHE_CREATE_MASK;
-
+    /*先试图从已有的缓存中找到一个可以满足要求的进行复用，这样就不用创建新的缓存了
+      如果找到了就可以跳转到out_unlock直接复用该cache*/
 	s = __kmem_cache_alias(name, size, align, flags, ctor);
 	if (s)
 		goto out_unlock;
 
+    /*获取cache name,如果为空则直接返回*/
 	cache_name = kstrdup_const(name, GFP_KERNEL);
 	if (!cache_name) {
 		err = -ENOMEM;
 		goto out_unlock;
 	}
 
+    /*在无法复用的情况下创建一个slub           cache缓存*/
 	s = create_cache(cache_name, size, size,
 			 calculate_alignment(flags, align, size),
 			 flags, ctor, NULL, NULL);
