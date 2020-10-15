@@ -3233,17 +3233,22 @@ static inline int slab_order(int size, int min_objects,
 	int order;
 	int rem;
 	int min_order = slub_min_order;
-
+    /*MAX_OBJS_PER_PAGE定义了一个页面存储的最大对象数(32767)，如果根据min_order和size计算出来的
+	 对象数超过了该值，则对象数取MAX_OBJS_PER_PAGE，再计算阶数*/
 	if (order_objects(min_order, size, reserved) > MAX_OBJS_PER_PAGE)
 		return get_order(size * MAX_OBJS_PER_PAGE) - 1;
-
+    /*从min_object到max_object*/
 	for (order = max(min_order, get_order(min_objects * size + reserved));
 			order <= max_order; order++) {
-
+                
+        /*slab大小小于根据最小对象数和size计算出来的slab大小，不符合要求*/
 		unsigned long slab_size = PAGE_SIZE << order;
-
+        /*满足此关系式表示碎片在要求范围内，则该order可以满足要求，
+          fract_leftover越小，则对碎片的要求越宽松*/
 		rem = (slab_size - reserved) % size;
-
+        
+        /*满足此关系式表示碎片在要求范围内，则该order可以满足要求，
+		  fract_leftover越小，则对碎片的要求越宽松*/
 		if (rem <= slab_size / fract_leftover)
 			break;
 	}
@@ -3266,19 +3271,31 @@ static inline int calculate_order(int size, int reserved)
 	 * First we increase the acceptable waste in a slab. Then
 	 * we reduce the minimum objects required in a slab.
 	 */
+	 /*slub_min_objects全局变量指定了slab中的最小对象数,
+       如果没有指定slab中的最小对象数则根据系统的CPU数进行计算*/
 	min_objects = slub_min_objects;
 	if (!min_objects)
 		min_objects = 4 * (fls(nr_cpu_ids) + 1);
+    
+    /*slub_max_order全局变量指定了一个slab可以占用的最大页框阶数，根据该值
+	  计算出slab中的最大对象数*/
 	max_objects = order_objects(slub_max_order, size, reserved);
+    /*min_objects取最小的objects值*/
 	min_objects = min(min_objects, max_objects);
 
+    /*两个while循环嵌套用来计算slab的阶数，当无法找到满足条件的order时，
+     内循环用来减小fraction的值以放宽对碎片的要求，外循环用来减小min_objects以放宽对slab的
+      最小对象数的要求*/
 	while (min_objects > 1) {
-		fraction = 16;
-		while (fraction >= 4) {
+		fraction = 16;/*fraction用来衡量对碎片的要求标准，该值越大，则允许的碎片越少!*/
+		while (fraction >= 4) {//fraction不能小于4
+		    /*计算slab的页框阶数*/
 			order = slab_order(size, min_objects,
 					slub_max_order, fraction, reserved);
+            /*阶数不大于slub_max_order，则符合要求*/
 			if (order <= slub_max_order)
 				return order;
+            /*否则降低fraction，重新计算*/
 			fraction /= 2;
 		}
 		min_objects--;
@@ -3288,6 +3305,7 @@ static inline int calculate_order(int size, int reserved)
 	 * We were unable to place multiple objects in a slab. Now
 	 * lets see if we can place a single object there.
 	 */
+	/*经过前面的步骤无法找到满足要求的order，只能从slub_max_order中选择存放1个对象，并且忽略碎片*/
 	order = slab_order(size, 1, slub_max_order, 1, reserved);
 	if (order <= slub_max_order)
 		return order;
@@ -3295,6 +3313,7 @@ static inline int calculate_order(int size, int reserved)
 	/*
 	 * Doh this slab cannot be placed using slub_max_order.
 	 */
+	 /*还不行的话，则将slab的order上限提升至MAX_ORDER，对应伙伴系统的最高分配阶*/
 	order = slab_order(size, 1, MAX_ORDER, 1, reserved);
 	if (order < MAX_ORDER)
 		return order;
@@ -3570,7 +3589,7 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 	if (forced_order >= 0)
 		order = forced_order;
 	else
-		order = calculate_order(size, s->reserved);
+		order = calculate_order(size, s->reserved);/*否则的话要根据size进行计算*/
     
     //如果order < 0则直接return 0；
 	if (order < 0)
@@ -3638,6 +3657,8 @@ static int kmem_cache_open(struct kmem_cache *s, unsigned long flags)
 	 * The larger the object size is, the more pages we want on the partial
 	 * list to avoid pounding the page allocator excessively.
 	 */
+	 /*根据对象大小计算partial slab链表中slab的最小数目，size越大，slab数目越大，
+	   以免过度使用页框分配器*/
 	set_min_partial(s, ilog2(s->size) / 2);
 
 	set_cpu_partial(s);
@@ -3651,10 +3672,11 @@ static int kmem_cache_open(struct kmem_cache *s, unsigned long flags)
 		if (init_cache_random_seq(s))
 			goto error;
 	}
-
+    /*初始化struct kmem_cache_node,对于NUMA架构要先分配kmem_cache_node*/
 	if (!init_kmem_cache_nodes(s))
 		goto error;
-
+    
+    /*初始化struct kmem_cache_cpu,对于SMP系统要先分配kmem_cache_cpu*/
 	if (alloc_kmem_cache_cpus(s))
 		return 0;
 
