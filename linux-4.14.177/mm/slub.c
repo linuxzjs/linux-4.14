@@ -2166,13 +2166,19 @@ static void unfreeze_partials(struct kmem_cache *s,
 #ifdef CONFIG_SLUB_CPU_PARTIAL
 	struct kmem_cache_node *n = NULL, *n2 = NULL;
 	struct page *page, *discard_page = NULL;
-
+    /*c->partial != NULL,则进入while循环，释放page*/
 	while ((page = c->partial)) {
 		struct page new;
 		struct page old;
-
+        /*page->next指向下一个需要释放的page的地址，所以将这个page->next赋值给c->partial
+        partial指向需要释放的第一个page
+        */
 		c->partial = page->next;
-
+        /*获取该page所在的node，在一个kmem_cache当中可能存在多个kmem_cache_node node，
+        此时n=NULL,如果n2==n则说明该page不在node上，所以就在cpu_slub->partial上
+        则进入if判断，
+        如果n2!=NULL,则进入if判断语句，执行n=n2操作并加锁，此时说明该page在node上
+        */
 		n2 = get_node(s, page_to_nid(page));
 		if (n != n2) {
 			if (n)
@@ -2181,23 +2187,28 @@ static void unfreeze_partials(struct kmem_cache *s,
 			n = n2;
 			spin_lock(&n->list_lock);
 		}
-
+        
 		do {
-
+            /*page->freelist指向下一个该page当中第一个可用的object地址*/
 			old.freelist = page->freelist;
+            /*将该page的inuse, frozen, objects赋给old.counters*/
 			old.counters = page->counters;
 			VM_BUG_ON(!old.frozen);
 
 			new.counters = old.counters;
 			new.freelist = old.freelist;
 
-			new.frozen = 0;
+			new.frozen = 0;//page释放到node上说明该page未被cpu_slub cache主，被释放到node上设置为0
 
 		} while (!__cmpxchg_double_slab(s, page,
 				old.freelist, old.counters,
 				new.freelist, new.counters,
 				"unfreezing slab"));
-
+        /*如果为真!new.inuse && n->nr_partial >= s->min_partial，则new.inuse=0,node上的slub总和大于kmem_cache min_partinal
+        最大的slub总和，所以需要将这个page从node中释放掉，此时将page插入到discard_page链表当中，discard_page始终指向该链表当中的
+        第一个page
+        如果为假，则只需要将该page转移到kmem_cache_node 的node链表当中即可。
+        */
 		if (unlikely(!new.inuse && n->nr_partial >= s->min_partial)) {
 			page->next = discard_page;
 			discard_page = page;
@@ -2209,12 +2220,14 @@ static void unfreeze_partials(struct kmem_cache *s,
 
 	if (n)
 		spin_unlock(&n->list_lock);
-
+    
+    /*discard_page不为空，说明这个链表当中的page需要free出去，返回给buddy system，完成这个page的最终释放。*/
 	while (discard_page) {
 		page = discard_page;
 		discard_page = discard_page->next;
 
 		stat(s, DEACTIVATE_EMPTY);
+        /*将page从slub当中释放出去，完成slub最后的一种释放情况。*/
 		discard_slab(s, page);
 		stat(s, FREE_SLAB);
 	}
@@ -2241,11 +2254,18 @@ static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
 	do {
 		pages = 0;
 		pobjects = 0;
+        /*获取kmem_cache_cpu per cpu上 partial的第一个page*/
 		oldpage = this_cpu_read(s->cpu_slab->partial);
 
 		if (oldpage) {
+            /*oldpage->pobjects得到cpu_slub->partial上所有slub空闲(free)的objects个数的总和sum*/
 			pobjects = oldpage->pobjects;
+            /*kmem_cache_cpu cpu_slub->partial上剩余的slub个数*/
 			pages = oldpage->pages;
+            /*如果drain=1,且cpu_slub->pratial当中空闲的objects个数大于slub当中object个数时，将cpu_slub->pratial的slub转移到
+             kmem_cache_node的node->partial上
+             cpu_partial：per cpu partial中所有slab的空闲free object的数量的最大值，超过这个值就会将所有的slab转移到kmem_cache_node的partial链表。
+             */
 			if (drain && pobjects > s->cpu_partial) {
 				unsigned long flags;
 				/*
@@ -2253,6 +2273,7 @@ static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
 				 * set to the per node partial list.
 				 */
 				local_irq_save(flags);
+                /*解冻partial，将page转移到node上或者是直接释放掉，将该page放回到buddy system当中*/
 				unfreeze_partials(s, this_cpu_ptr(s->cpu_slab));
 				local_irq_restore(flags);
 				oldpage = NULL;
@@ -2261,16 +2282,20 @@ static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
 				stat(s, CPU_PARTIAL_DRAIN);
 			}
 		}
-
+        
 		pages++;
+        /*加上page空闲的object个数*/
 		pobjects += page->objects - page->inuse;
-
+        //将pages赋给page说明该page所在的cpu_slub->partial上存在多少个slub
 		page->pages = pages;
-		page->pobjects = pobjects;
+		page->pobjects = pobjects;//空闲的object总和
+		/*将这个oldpage首地址赋给新的page形成一个就相当于由原来的cpu_slub->partial=oldpage变成了cpu_slub->partial=page
+		oldpage向后移动一个page形成了一个新的cpu_slub->partial就相当于将cpu_slub->page 转移到了cpu_slub->partial上
+		*/
 		page->next = oldpage;
-
 	} while (this_cpu_cmpxchg(s->cpu_slab->partial, oldpage, page)
 								!= oldpage);
+    /*如果per cpu partial中所有slab的空闲free object的数量的最大值<0,则重新进入unfreeze_partials函数*/
 	if (unlikely(!s->cpu_partial)) {
 		unsigned long flags;
 
@@ -2853,12 +2878,29 @@ static void __slab_free(struct kmem_cache *s, struct page *page,
 			spin_unlock_irqrestore(&n->list_lock, flags);
 			n = NULL;
 		}
+        //获取释放对象所在slub的第一个空闲object对象
 		prior = page->freelist;
+        /*将待释放的slub 的counters赋给counters,counters是一个union：包含inuse、
+        objects、frozen三个数据*/
 		counters = page->counters;
+        /* 待释放对象的下一对象指针指向原freelist */
 		set_freepointer(s, tail, prior);
+        /*counters一赋值给new,就相当于把inuse,object,frozen都赋值给new了*/
 		new.counters = counters;
-		was_frozen = new.frozen;
-		new.inuse -= cnt;
+		was_frozen = new.frozen;//frozen = 1代表该slub被cpu使用被cache住，如果位0则说明该内存此时并未被使用
+		new.inuse -= cnt;//inuse表示该slab中已分配出去的对象个数，减去cnt就相当于释放了cnt个objects
+		
+		/*
+		1. 当!new.inuse || !prior为真，prior = NULL，new.inuse = 0 则说明page->freelist=NULL, 这个page是存在cpu_slub->page，
+		   cpu_slub->freelist从该page上分配object，此时inuse=0,说明该page上的object全部都被free了，所以该page是一个空的。
+		   
+		   如果!was_frozen为真，则was_frozen=0，此时该page未被任何cpu cache主，属于kmem_cache_node node->partial,或者是full，
+		   当然slub不存在full,使用get_node，同时对node加锁spin_lock_irqsave(&n->list_lock, flags);
+		   
+		   如果!was_frozen为假，则was_frozen=1，此时page被kmem_cache_cpu cache说明该page是在kmem_cache_cpu上的partial，或者是freelist上
+		   直接完成释放即可，或者是在cpu->freelist释放完后转移到到cpu->partial上等。
+		2. 当!new.inuse || !prior为假，那就不用去操作kmem_cache_node中的链，就直接把object释放添加到加到page->freelist中即可。
+		*/  
 		if ((!new.inuse || !prior) && !was_frozen) {
 
 			if (kmem_cache_has_cpu_partial(s) && !prior) {
@@ -2869,10 +2911,10 @@ static void __slab_free(struct kmem_cache *s, struct page *page,
 				 * We can defer the list move and instead
 				 * freeze it.
 				 */
-				new.frozen = 1;
+				new.frozen = 1;//此时说明该page在kmem_cache_page上，后续将转移到partial上，
 
 			} else { /* Needs to be taken off a list */
-
+                /*说明该page在kmem_cache_node上，使用get_node获取node值，并对node n加锁保护*/
 				n = get_node(s, page_to_nid(page));
 				/*
 				 * Speculatively acquire the list_lock.
@@ -2891,7 +2933,11 @@ static void __slab_free(struct kmem_cache *s, struct page *page,
 		prior, counters,
 		head, new.counters,
 		"__slab_free"));
-
+        
+    /*当node n为NULL，只存在一种可能性：该page是存在kmem_cache_cpu当中，
+      如果new.frozen && !was_frozen为真，则new.frozen=1，was_frozen=0说明进入了上面代码的第一个循环
+      此时将freelist page转移到kmem_cache_cpu->pratial上，
+    */
 	if (likely(!n)) {
 
 		/*
@@ -2906,11 +2952,18 @@ static void __slab_free(struct kmem_cache *s, struct page *page,
 		 * The list lock was not taken therefore no list
 		 * activity can be necessary.
 		 */
+		 //如果was_froze为真，则说明该page在per cpu cache的freelist 则直接释放即可。
 		if (was_frozen)
 			stat(s, FREE_FROZEN);
 		return;
 	}
+    /*当释放掉这个对象后，如果该判断条件为真，则new.inuse = 0说明该slub中的object均为空，没有任何被使用且该page在kmem_cache_node的node上
+     同时n->nr_partial >= s->min_partial则说明kmem_cache_node当中的slub已经是超过了真个slub cache最大的
+     slub个数，所以需要跳转到slab_empty当中释放node->partial slub
 
+     这里介绍一点mini_partial的作用：限制struct kmem_cache_node中的partial链表slub的数量。虽说是mini_partial，
+     但是代码的本意告诉我这个变量是kmem_cache_node中partial链表最大slab数量，如果大于这个mini_partial的值，那么多余的slab就会被释放。
+    */
 	if (unlikely(!new.inuse && n->nr_partial >= s->min_partial))
 		goto slab_empty;
 
@@ -2918,30 +2971,36 @@ static void __slab_free(struct kmem_cache *s, struct page *page,
 	 * Objects left in the slab. If it was not on the partial list before
 	 * then add it.
 	 */
+	//如果prior为NULL,则表示在释放之前该slab没有空闲的object了，即在full 链中
 	if (!kmem_cache_has_cpu_partial(s) && unlikely(!prior)) {
 		if (kmem_cache_debug(s))
 			remove_full(s, n, page);
 		add_partial(n, page, DEACTIVATE_TO_TAIL);
 		stat(s, FREE_ADD_PARTIAL);
 	}
+    //对kmem_cache_node的操作结束，则释放node锁
 	spin_unlock_irqrestore(&n->list_lock, flags);
 	return;
+
 
 slab_empty:
 	if (prior) {
 		/*
 		 * Slab on the partial list.
 		 */
+		/*如果是kmam_cache_node的partial，且new.inuse=0，此时prior！=NULL， 
+		 此时释放partial slub，释放该page，同时nr_partial--;
+        */
 		remove_partial(n, page);
 		stat(s, FREE_REMOVE_PARTIAL);
 	} else {
 		/* Slab must be on the full list */
-		remove_full(s, n, page);
+		remove_full(s, n, page);/*这种情况下就是原来那个slab只有一个object，那这个object被分配出去后就在full链里，现在要释放这个object就得把这个slab从full链上摘除*/
 	}
 
 	spin_unlock_irqrestore(&n->list_lock, flags);
 	stat(s, FREE_SLAB);
-	discard_slab(s, page);
+	discard_slab(s, page);//将该page释放掉，放回buddy system系统当中。
 }
 
 /*
@@ -2975,14 +3034,15 @@ redo:
 	 */
 	do {
 		tid = this_cpu_read(s->cpu_slab->tid);
-		c = raw_cpu_ptr(s->cpu_slab);
+		c = raw_cpu_ptr(s->cpu_slab);//获取per cpu的freelist也就是对应的page
 	} while (IS_ENABLED(CONFIG_PREEMPT) &&
 		 unlikely(tid != READ_ONCE(c->tid)));
 
 	/* Same with comment on barrier() in slab_alloc_node() */
 	barrier();
-
+    
 	if (likely(page == c->page)) {
+        /* 更新freelist指针，指向刚释放的对象 */
 		void **freelist = READ_ONCE(c->freelist);
 
 		set_freepointer(s, tail_obj, freelist);
@@ -2995,9 +3055,11 @@ redo:
 			note_cmpxchg_failure("slab_free", s, tid);
 			goto redo;
 		}
+        /*设置快速释放通道标注*/
 		stat(s, FREE_FASTPATH);
 	} else
-		__slab_free(s, page, head, tail_obj, cnt, addr);
+		__slab_free(s, page, head, tail_obj, cnt, addr);  /* 慢速路径释放,走到这一步基本上只有三种情况要不page再node、
+		page在cpu_slub partial上，再或者是在full partial，当然了slub是不存在full partial*/
 
 }
 
