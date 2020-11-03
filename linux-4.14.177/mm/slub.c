@@ -2262,7 +2262,7 @@ static void put_cpu_partial(struct kmem_cache *s, struct page *page, int drain)
 			pobjects = oldpage->pobjects;
             /*kmem_cache_cpu cpu_slub->partial上剩余的slub个数*/
 			pages = oldpage->pages;
-            /*如果drain=1,且cpu_slub->pratial当中空闲的objects个数大于slub当中object个数时，将cpu_slub->pratial的slub转移到
+            /*如果drain=1,且cpu_slub->pratial当中空闲的objects个数大于slub当中free object的数量的最大值，将cpu_slub->pratial的slub转移到
              kmem_cache_node的node->partial上
              cpu_partial：per cpu partial中所有slab的空闲free object的数量的最大值，超过这个值就会将所有的slab转移到kmem_cache_node的partial链表。
              */
@@ -2895,14 +2895,14 @@ static void __slab_free(struct kmem_cache *s, struct page *page,
 		   cpu_slub->freelist从该page上分配object，此时inuse=0,说明该page上的object全部都被free了，所以该page是一个空的。
 		   
 		   如果!was_frozen为真，则was_frozen=0，此时该page未被任何cpu cache主，属于kmem_cache_node node->partial,或者是full，
-		   当然slub不存在full,使用get_node，同时对node加锁spin_lock_irqsave(&n->list_lock, flags);
+		   使用get_node，同时对node加锁spin_lock_irqsave(&n->list_lock, flags);
 		   
 		   如果!was_frozen为假，则was_frozen=1，此时page被kmem_cache_cpu cache说明该page是在kmem_cache_cpu上的partial，或者是freelist上
 		   直接完成释放即可，或者是在cpu->freelist释放完后转移到到cpu->partial上等。
 		2. 当!new.inuse || !prior为假，那就不用去操作kmem_cache_node中的链，就直接把object释放添加到加到page->freelist中即可。
 		*/  
 		if ((!new.inuse || !prior) && !was_frozen) {
-
+            /*如果这个判断条件成立说明这个可能时在kmem_cache_node上，则只有一种可能性就是这个page是一个 full page*/
 			if (kmem_cache_has_cpu_partial(s) && !prior) {
 
 				/*
@@ -2911,7 +2911,7 @@ static void __slab_free(struct kmem_cache *s, struct page *page,
 				 * We can defer the list move and instead
 				 * freeze it.
 				 */
-				new.frozen = 1;//此时说明该page在kmem_cache_page上，后续将转移到partial上，
+				new.frozen = 1;//此时说明该page在kmem_cache_cpu上，后续将转移到partial上，
 
 			} else { /* Needs to be taken off a list */
                 /*说明该page在kmem_cache_node上，使用get_node获取node值，并对node n加锁保护*/
@@ -3891,15 +3891,18 @@ void *__kmalloc(size_t size, gfp_t flags)
 {
 	struct kmem_cache *s;
 	void *ret;
-
+    /*判断size的大小， 如果size > page_size*2 对于我们来说就是4k*2  =8k，
+        则进入kmalloc_large分配内存*/
 	if (unlikely(size > KMALLOC_MAX_CACHE_SIZE))
 		return kmalloc_large(size, flags);
 
+    /*根据size选择合适的kmalloc_caches[]，kmalloc_caches结构体在系统启动之处完成初始化操作*/
 	s = kmalloc_slab(size, flags);
 
 	if (unlikely(ZERO_OR_NULL_PTR(s)))
 		return s;
-
+    
+    /*从kmalloc_caches slub当中额分配object，完成内存的分配*/
 	ret = slab_alloc(s, flags, _RET_IP_);
 
 	trace_kmalloc(_RET_IP_, ret, size, s->size, flags);

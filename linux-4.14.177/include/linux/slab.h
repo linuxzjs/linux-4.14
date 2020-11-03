@@ -415,7 +415,9 @@ kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order)
 
 static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
 {
+    /*根据size大小判断出对应的order阶数大小，进入buddy system分配对应的内存*/
 	unsigned int order = get_order(size);
+    /*根据size, order分配对应的内存*/
 	return kmalloc_order_trace(size, flags, order);
 }
 
@@ -476,6 +478,8 @@ static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
 static __always_inline void *kmalloc(size_t size, gfp_t flags)
 {
 	if (__builtin_constant_p(size)) {
+        /*判断size的大小， 如果size > page_size*2 对于我们来说就是4k*2  =8k，
+        则进入kmalloc_large分配内存，否则使用__kmalloc分配内存*/
 		if (size > KMALLOC_MAX_CACHE_SIZE)
 			return kmalloc_large(size, flags);
 #ifndef CONFIG_SLOB

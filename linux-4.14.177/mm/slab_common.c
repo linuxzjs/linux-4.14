@@ -1138,6 +1138,7 @@ void *kmalloc_order(size_t size, gfp_t flags, unsigned int order)
 	struct page *page;
 
 	flags |= __GFP_COMP;
+    /*根据order分配对应的page物理地址，并将page物理地址根据page_address转换成虚拟地址，返回给用户使用*/
 	page = alloc_pages(flags, order);
 	ret = page ? page_address(page) : NULL;
 	kmemleak_alloc(ret, size, 1, flags);
@@ -1149,6 +1150,7 @@ EXPORT_SYMBOL(kmalloc_order);
 #ifdef CONFIG_TRACING
 void *kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order)
 {
+    /*buddy system分配page内存*/
 	void *ret = kmalloc_order(size, flags, order);
 	trace_kmalloc(_RET_IP_, ret, size, PAGE_SIZE << order, flags);
 	return ret;
