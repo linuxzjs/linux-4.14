@@ -198,8 +198,9 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 	else
 		min_brk = mm->end_data;
 #else
-	min_brk = mm->start_brk;
+	min_brk = mm->start_brk;//堆栈的起始地址，也就是最小地址。
 #endif
+    /*如果分配的brk地址小于 min_brk堆栈段的最小地址则，直接return */
 	if (brk < min_brk)
 		goto out;
 
@@ -209,31 +210,59 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 	 * segment grow beyond its set limit the in case where the limit is
 	 * not page aligned -Ram Gupta
 	 */
+	 /*
+	 对堆栈，以及数据段长度进行判断，如果合法则继续执行，负责直接return结束
+	 */
 	if (check_data_rlimit(rlimit(RLIMIT_DATA), brk, mm->start_brk,
 			      mm->end_data, mm->start_data))
 		goto out;
-
+    
+    /**
+	 * 由于brk系统调用作用于某一个线性区，它分配和释放完整的页。
+	 * 因此，把addr高速为PAGE_SIZE的整数倍。然后把调整的结束与内存描述符的brk字段的值进行比较，
+	 * 如果新的brk与oldbrk一样则说明当前oldbrk时可用的则不需要再去分配内存，直接进入到set_brk
+	 * 等待内存的使用
+	 */
 	newbrk = PAGE_ALIGN(brk);
 	oldbrk = PAGE_ALIGN(mm->brk);
 	if (oldbrk == newbrk)
 		goto set_brk;
 
 	/* Always allow shrinking brk. */
+    /*如果brk新的代码段边界小于mm->brk oldbrk旧的代码段边界则说明这个内存分操作时请求缩小堆栈，
+    需要通过do_munmap释放一定的空间，缩堆栈空间。
+    */
 	if (brk <= mm->brk) {
+        /*如果释放的后的代码段空间满足需求则直接跳转到set_brk路径下，
+          否则空间依然不够则直接进入到return out返回。
+        */
 		if (!do_munmap(mm, newbrk, oldbrk-newbrk, &uf))
 			goto set_brk;
 		goto out;
 	}
 
 	/* Check against existing mmap mappings. */
+    /*
+    检查扩大后的堆是否与进程其他线性区重叠。如果是，不做任何事情就返回。
+    */
 	next = find_vma(mm, oldbrk);
 	if (next && newbrk + PAGE_SIZE > vm_start_gap(next))
 		goto out;
 
 	/* Ok, looks good - let it rip. */
+    /**
+	 * 如果一切顺利，则调用do_brk_flags函数。该函数其实是do_mmap的简化版。
+	 * 如果它返回oldbrk，则分配成功且sys_brk返回addr的值，否则返回mm->brk值。
+	 */
 	if (do_brk_flags(oldbrk, newbrk-oldbrk, 0, &uf) < 0)
 		goto out;
 
+    /*
+    顺利执行到此处，将populate = newbrk > oldbrk && (mm->def_flags & VM_LOCKED) != 0;、
+    判断populate是否为VM_LOCKED如果时则需要在分配内存的同时完成物理地址与虚拟地址之间的映射
+    负责分配时虚拟地址与物理地址之间并没有建立映射关系，只有使用时发生异常此时才会建立物理内存与虚拟内存的映射关系。
+    由该函数mm_populate完成。
+    */
 set_brk:
 	mm->brk = brk;
 	populate = newbrk > oldbrk && (mm->def_flags & VM_LOCKED) != 0;
@@ -1807,26 +1836,43 @@ unsigned long unmapped_area(struct vm_unmapped_area_info *info)
 	unsigned long length, low_limit, high_limit, gap_start, gap_end;
 
 	/* Adjust search length to account for worst case alignment overhead */
+    /*数据结构体溢出，说明info->length太大，造成了数据类型的溢出*/
 	length = info->length + info->align_mask;
 	if (length < info->length)
 		return -ENOMEM;
 
 	/* Adjust search limits by the desired length */
+    /*length 大于TASK_SIZE超过进程的最大空间，直接return -ENOMEM */
 	if (info->high_limit < length)
 		return -ENOMEM;
-	high_limit = info->high_limit - length;
+	high_limit = info->high_limit - length;//将task_size与length的差值赋给high_limit
 
+    /*low_limit = mm->mmap_base，如果low_limit > high_limit，如果不直接return -ENOMEM,将导致
+      low_limit = info->low_limit + length > TASK_SIZE这个是不被允许的，所以只有当info->low_limit <= high_limit
+      是才会继续向下执行，完成low_limit = info->low_limit + length操作。起到保护边进程边界的作用。
+    */
 	if (info->low_limit > high_limit)
 		return -ENOMEM;
 	low_limit = info->low_limit + length;
 
 	/* Check if rbtree root looks promising */
+    /*如果rb树为空，则它将移动到check_highest标签*/
 	if (RB_EMPTY_ROOT(&mm->mm_rb))
 		goto check_highest;
+    
+    /*
+      从内存描述符的根节点获取vma。
+      如果根节点的rb_subtree_gap小于length长度，则根节点下方的节点中将没有空白空间，
+      因此它将移至check_highest标签以检查最大空间。即每个vma之间的间隙小于length长度，
+      并且无法在它们之间添加，则检查最高区域。
+    */
 	vma = rb_entry(mm->mm_rb.rb_node, struct vm_area_struct, vm_rb);
 	if (vma->rb_subtree_gap < length)
 		goto check_highest;
 
+    /*
+    循环遍历当前任务的虚拟存储区vma，并找到在rb树中沿左节点方向找到了长度的间隙空间的节点
+    */
 	while (true) {
 		/* Visit left subtree if it looks promising */
 		gap_end = vm_start_gap(vma);
@@ -1839,17 +1885,26 @@ unsigned long unmapped_area(struct vm_unmapped_area_info *info)
 				continue;
 			}
 		}
-
+        //计算内存间隙的起始地址
 		gap_start = vma->vm_prev ? vm_end_gap(vma->vm_prev) : 0;
 check_current:
 		/* Check if current node has a suitable gap */
+        /*
+        如果间隙起始地址超过high_limit，则返回-ENOMEM错误，
+        与info->low_limit > high_limit会导致同样类似的问题。
+        */
 		if (gap_start > high_limit)
 			return -ENOMEM;
+        
+        /*gap_end大于或等于low_limit并且间隙区域大于长度，它将移动到找到的标签。
+        将mmap->base + length包含在 gap_start ~ gap_end之间，说明该gap是可用的。
+        */
 		if (gap_end >= low_limit &&
 		    gap_end > gap_start && gap_end - gap_start >= length)
 			goto found;
-
+        
 		/* Visit right subtree if it looks promising */
+        /*如果节点的右下节点存在并且该节点的间隙区域大于长度，则将右节点替换为vma区域并继续循环*/
 		if (vma->vm_rb.rb_right) {
 			struct vm_area_struct *right =
 				rb_entry(vma->vm_rb.rb_right,
@@ -1861,6 +1916,8 @@ check_current:
 		}
 
 		/* Go back up the rbtree to find next candidate node */
+        /*下部没有合适的间隙区域，它将再次上升到上部节点；如果从左侧节点上升到上部节点，
+        间隙开始和结束将被更新，并且标签将移至check_current*/
 		while (true) {
 			struct rb_node *prev = &vma->vm_rb;
 			if (!rb_parent(prev))
@@ -1874,7 +1931,10 @@ check_current:
 			}
 		}
 	}
-
+    /*
+    check_highest：在这个地方，rb树的空白区域不需要空间，因此在其上方的空白处进行搜索。
+    如果此处没有确保适当的空间，则会返回-ENOMEM错误。
+    */
 check_highest:
 	/* Check highest gap, which does not precede any rbtree node */
 	gap_start = mm->highest_vm_end;
@@ -1882,6 +1942,11 @@ check_highest:
 	if (gap_start > high_limit)
 		return -ENOMEM;
 
+    /*
+     至少使用info-> low_limit调整找到的间隙的开始位置。
+    通过添加调整后的间隙偏移量并使用info-> align_mask对其进行切割，来调整间隙的起始位置，然后返回。
+    可以调整由于文件和缓存别名而发现的未映射间隙的起始位置。
+    */
 found:
 	/* We found a suitable gap. Clip it with the original low_limit. */
 	if (gap_start < info->low_limit)
@@ -2006,6 +2071,10 @@ found_highest:
  * This function "knows" that -ENOMEM has the bits set.
  */
 #ifndef HAVE_ARCH_UNMAPPED_AREA
+/*
+arm体系结构实现的功能，它在当前任务用户区域的mmap映射空间中从底部到顶部搜索，
+并找到可以包含请求长度的未映射空白区域的虚拟起始地址
+*/
 unsigned long
 arch_get_unmapped_area(struct file *filp, unsigned long addr,
 		unsigned long len, unsigned long pgoff, unsigned long flags)
@@ -2013,13 +2082,18 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma, *prev;
 	struct vm_unmapped_area_info info;
-
+    /*请求的地址长度大于task_size减去mmap映射的最小地址则直接return -ENOMEM*/
 	if (len > TASK_SIZE - mmap_min_addr)
 		return -ENOMEM;
-
+    
+    /*使用了MAP_FIXED标志，则addr将按原样返回而无需地址转换*/
 	if (flags & MAP_FIXED)
 		return addr;
 
+    /*
+    虚拟地址addr时，将按页面对其进行排序，并从当前任务中注册的vma信息中检索vma。
+    如果虚拟地址可以放置在用户空间中并且小于vma区域，则退出该功能。
+    */
 	if (addr) {
 		addr = PAGE_ALIGN(addr);
 		vma = find_vma_prev(mm, addr, &prev);
@@ -2029,6 +2103,11 @@ arch_get_unmapped_area(struct file *filp, unsigned long addr,
 			return addr;
 	}
 
+    /*
+    找到具有以下信息的未映射区域并返回其虚拟地址。
+    映射区域的下限地址替换为low_limit。
+    对于high_limit，将替换用户空间的上限地址
+    */
 	info.flags = 0;
 	info.length = len;
 	info.low_limit = mm->mmap_base;
@@ -2054,13 +2133,18 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
 	struct vm_unmapped_area_info info;
 
 	/* requested length too big for entire address space */
+    /*length 长度超出了进程最大的限定空间*/
 	if (len > TASK_SIZE - mmap_min_addr)
 		return -ENOMEM;
-
+    /*MAP_FIXED标志，则addr将按原样返回而无需地址转换*/
 	if (flags & MAP_FIXED)
 		return addr;
 
 	/* requesting a specific address */
+    /*
+    指定了虚拟地址addr时，将按页面对其进行排序，并从当前任务中注册的vma信息中检索vma。
+    如果虚拟地址可以放置在用户空间中并且小于vma区域，则退出该功能。
+    */
 	if (addr) {
 		addr = PAGE_ALIGN(addr);
 		vma = find_vma_prev(mm, addr, &prev);
@@ -2070,6 +2154,11 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
 			return addr;
 	}
 
+    /*
+    它找到具有以下信息的未映射区域并返回其虚拟地址。
+    映射区域的下限地址替换为low_limit。
+    对于high_limit，将替换用户空间的上限地址
+    */
 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
 	info.length = len;
 	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
@@ -2107,9 +2196,15 @@ get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
 		return error;
 
 	/* Careful about overflows.. */
+    /*分配空间超出了进程的最大空间*/
 	if (len > TASK_SIZE)
 		return -ENOMEM;
 
+    /*
+    检索未映射的区域，在文件映射的情况下，将使用从文件描述符获取未映射区域的处理函数。
+    作为参考，do_brk（）不使用文件映射，而是通过为anon映射的文件参数分配null来调用。
+    共享区域的处理程序函数使用shmem_get_unmapped_area（）函数。
+    */
 	get_area = current->mm->get_unmapped_area;
 	if (file) {
 		if (file->f_op->get_unmapped_area)
@@ -2124,12 +2219,17 @@ get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
 		get_area = shmem_get_unmapped_area;
 	}
 
+    /*获取未映射的虚拟地址空间，这个函数是函数的核心部分,该函数是一个回掉函数
+    原函数是arch_get_unmapped_area
+    */
 	addr = get_area(file, addr, len, pgoff, flags);
 	if (IS_ERR_VALUE(addr))
 		return addr;
-
+    
+    /*找到的虚拟地址不能放在用户空间中，则返回-ENOMEM错误*/
 	if (addr > TASK_SIZE - len)
 		return -ENOMEM;
+    /*获得的虚拟地址是页面0，则返回-EINVAL错误*/
 	if (offset_in_page(addr))
 		return -EINVAL;
 
@@ -2885,6 +2985,9 @@ static inline void verify_mm_writelocked(struct mm_struct *mm)
  *  anonymous maps.  eventually we may be able to do some
  *  brk-specific accounting here.
  */
+/*
+它其实是do_mmap的简化版，但是它比do_mmap快，因为它假定线性区不映射磁盘上的文件。从而避免了检查线性区对象上的几个字段。
+*/
 static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long flags, struct list_head *uf)
 {
 	struct mm_struct *mm = current->mm;
@@ -2894,14 +2997,21 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 	int error;
 
 	/* Until we need other flags, refuse anything except VM_EXEC. */
-	if ((flags & (~VM_EXEC)) != 0)
-		return -EINVAL;
+	if ((flags & (~VM_EXEC)) != 0)//不允许使用除VM_EXEC之外的所有标志。
+	//设置标志位
 	flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
 
+    /*
+    *搜索当前task任务的固定的映射空间，检查是否有可能进行固定映射，从当前的mmap映射空间当中找到包含该请求长度len未映射的空闲虚拟地址空间，加快内存的分配空间。
+    如果没有要映射的空间，则返回错误
+    */
 	error = get_unmapped_area(NULL, addr, len, 0, MAP_FIXED);
 	if (offset_in_page(error))
 		return error;
 
+    /*
+    当前任务中使用VM_LOCKED标志的页数超过了锁定页的最大数量限制，则会返回-EAGAIN错误
+    */
 	error = mlock_future_check(mm, mm->def_flags, len);
 	if (error)
 		return error;
@@ -2915,6 +3025,7 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 	/*
 	 * Clear old maps.  this also does some error checking for us
 	 */
+	 /*vmas与请求的虚拟地址区域重叠时，将使用do_munmap执行取消映射。*/
 	while (find_vma_links(mm, addr, addr + len, &prev, &rb_link,
 			      &rb_parent)) {
 		if (do_munmap(mm, addr, len, uf))
@@ -2922,9 +3033,14 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 	}
 
 	/* Check against address space limits *after* clearing old maps... */
+    /*当前任务的vm页总数超过了地址空间限制（RLIMIT_AS），如果是则返回-ENOMEM错误。*/
 	if (!may_expand_vm(mm, flags, len >> PAGE_SHIFT))
 		return -ENOMEM;
-
+    /*
+    当前任务的vma数量超过sysctl_max_map_count最大映射计数数量，则返回-ENOMEM。
+    sysctl_max_map_count
+    默认值为65530，可以通过 "/proc/sys/vm/max_map_count"更改此值
+    */
 	if (mm->map_count > sysctl_max_map_count)
 		return -ENOMEM;
 
@@ -2932,6 +3048,7 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 		return -ENOMEM;
 
 	/* Can we just expand an old private anonymous mapping? */
+    /*如果现有的vma使用私有匿名映射，请检查它是否可以合并和扩展，如果可能，请移至out标签*/
 	vma = vma_merge(mm, prev, addr, addr + len, flags,
 			NULL, NULL, pgoff, NULL, NULL_VM_UFFD_CTX);
 	if (vma)
@@ -2940,12 +3057,13 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 	/*
 	 * create a vma struct for an anonymous mapping
 	 */
+	/*为vma结构分配内存，并且在失败时，将已经增加的vm commit页面的数量恢复到原始状态，并返回-ENOMEM错误*/
 	vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
 	if (!vma) {
 		vm_unacct_memory(len >> PAGE_SHIFT);
 		return -ENOMEM;
 	}
-
+    //配置并添加vma信息,并设置相关属性
 	INIT_LIST_HEAD(&vma->anon_vma_chain);
 	vma->vm_mm = mm;
 	vma->vm_start = addr;
@@ -2956,10 +3074,13 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 	vma_link(mm, vma, prev, rb_link, rb_parent);
 out:
 	perf_event_mmap(vma);
+    /*out标签的起始位置，并更新了内存描述符中已使用的vm页面的总数*/
 	mm->total_vm += len >> PAGE_SHIFT;
 	mm->data_vm += len >> PAGE_SHIFT;
+    /*使用VM_LOCKED标志时，将更新内存描述符的locked_vm页面计数器*/
 	if (flags & VM_LOCKED)
 		mm->locked_vm += (len >> PAGE_SHIFT);
+    /*将VM_SOFTDIRTY添加到vma的标志*/
 	vma->vm_flags |= VM_SOFTDIRTY;
 	return 0;
 }
