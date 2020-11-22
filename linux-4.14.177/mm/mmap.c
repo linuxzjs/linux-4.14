@@ -2997,7 +2997,9 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 	int error;
 
 	/* Until we need other flags, refuse anything except VM_EXEC. */
-	if ((flags & (~VM_EXEC)) != 0)//不允许使用除VM_EXEC之外的所有标志。
+    //不允许使用除VM_EXEC之外的所有标志。
+	if ((flags & (~VM_EXEC)) != 0)
+	    return -EINVAL;
 	//设置标志位
 	flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
 
