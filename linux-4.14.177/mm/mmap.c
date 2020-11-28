@@ -552,14 +552,17 @@ static unsigned long count_vma_pages_range(struct mm_struct *mm,
 	struct vm_area_struct *vma;
 
 	/* Find first overlaping mapping */
+    /*如果现有的vma区域和请求区域在是否重叠，如果有则找到相关的vma。如果没有重叠区域，则返回0。*/
 	vma = find_vma_intersection(mm, addr, end);
 	if (!vma)
 		return 0;
 
+    /*计算当前vma中重叠页面的数量。*/
 	nr_pages = (min(end, vma->vm_end) -
 		max(addr, vma->vm_start)) >> PAGE_SHIFT;
 
 	/* Iterate over the rest of the overlaps */
+    /*计算下一个vma区域进行比较来计算重叠页面的数量，然后返回*/
 	for (vma = vma->vm_next; vma; vma = vma->vm_next) {
 		unsigned long overlap_len;
 
@@ -1381,7 +1384,7 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	int pkey = 0;
 
 	*populate = 0;
-
+    /*判断长度是否位0，如果位0则直接返回*/
 	if (!len)
 		return -EINVAL;
 
@@ -1391,33 +1394,49 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	 * (the exception is when the underlying filesystem is noexec
 	 *  mounted, in which case we dont add PROT_EXEC.)
 	 */
+	/*
+	请求读取属性时，如果在当前任务的个性中设置了READ_IMPLIES_EXEC，且如果是文件映射则会添加exec属性。
+    */
 	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
 		if (!(file && path_noexec(&file->f_path)))
 			prot |= PROT_EXEC;
-
+        
+    /*如果没有做固定映射，则使用页面对齐地址，但是如果它小于mmap_min_addr，则将其更改为mmap_min_addr地址。
+     这里所说的固定映射是之：映射过程没有执行的start, length要求*/
 	if (!(flags & MAP_FIXED))
 		addr = round_hint_to_min(addr);
 
 	/* Careful about overflows.. */
+    /*页对齐操作*/
 	len = PAGE_ALIGN(len);
 	if (!len)
 		return -ENOMEM;
 
 	/* offset overflow? */
+    /*请求空间溢出，这里如果pgoff + (len >> PAGE_SHIFT) < pgoff则就说明发生了unsigned long类型的数据溢出，页说明了映射空间过大，导致溢出*/
 	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)
 		return -EOVERFLOW;
 
 	/* Too many mappings? */
+    /*
+    当前任务的vma数量超过sysctl_max_map_count最大映射计数数量，则返回-ENOMEM。
+    sysctl_max_map_count
+    默认值为65530，可以通过 "/proc/sys/vm/max_map_count"更改此值
+    */
 	if (mm->map_count > sysctl_max_map_count)
 		return -ENOMEM;
 
 	/* Obtain the address to map to. we verify (or select) it and ensure
 	 * that it represents a valid section of the address space.
 	 */
+	/*
+	从当前进程空间当中查找一块未映射的虚拟地址，将虚拟地址的start其实地址， end结束地址作为映射的其实地址以及虚拟地址使用
+    */
 	addr = get_unmapped_area(file, addr, len, pgoff, flags);
 	if (offset_in_page(addr))
 		return addr;
 
+    /*如果存在执行属性则请求密钥保护没这个操作在ARM64位当中是无效的，没有被使用。*/
 	if (prot == PROT_EXEC) {
 		pkey = execute_only_pkey(mm);
 		if (pkey < 0)
@@ -1428,24 +1447,31 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	 * to. we assume access permissions have been handled by the open
 	 * of the memory object, so we don't do any here.
 	 */
+	/*将mayread，maywrite和mayexec添加到转换为vm标志的vm_flags，转换为vm标志的标志以及内存描述符的默认标志*/
 	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
 			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
 
+    /*判断是否请求MAP_LOCKED标志，则由于mlock最大限制而无法执行-EPERM错误，则返回-EPERM错误。*/
 	if (flags & MAP_LOCKED)
 		if (!can_do_mlock())
 			return -EPERM;
-
+        
+    /*通过将请求长度添加到现有mlock页面达到了最大mlock页面限制lock_limit，则返回-EAGAIN错误*/
 	if (mlock_future_check(mm, vm_flags, len))
 		return -EAGAIN;
-
+    
+    /*判断file文件是否为空，如果为空则说明这个是一个内存映射，不是文件映射。*/
 	if (file) {
+        /*如果是文件映射则获取文件inode节点*/
 		struct inode *inode = file_inode(file);
-
+        /*检查文件映射是否溢出，如果溢出则直接返回*/
 		if (!file_mmap_ok(file, inode, pgoff, len))
 			return -EOVERFLOW;
 
+        /*获取映射类型*/
 		switch (flags & MAP_TYPE) {
 		case MAP_SHARED:
+            /*判断文件是否有写属性，对没有写属性的文件发出写请求时，将返回-EACCESS错误。*/
 			if ((prot&PROT_WRITE) && !(file->f_mode&FMODE_WRITE))
 				return -EACCES;
 
@@ -1453,31 +1479,40 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			 * Make sure we don't allow writing to an append-only
 			 * file..
 			 */
+			/*在仅追加文件的情​​况下，在写请求的情况下，返回-EACCESS错误*/
 			if (IS_APPEND(inode) && (file->f_mode & FMODE_WRITE))
 				return -EACCES;
 
 			/*
 			 * Make sure there are no mandatory locks on the file.
 			 */
+			/*判断映射的文件是否加锁，如果加锁怎无法操作，直接return -EAGAIN*/
 			if (locks_verify_locked(file))
 				return -EAGAIN;
-
+            
+            /*增加共享和mayshare属性到vm_flags*/
 			vm_flags |= VM_SHARED | VM_MAYSHARE;
+            /*判断文件是否可写，如果不可写则对于没有write属性的文件，删除maywrite和shared属性*/
 			if (!(file->f_mode & FMODE_WRITE))
 				vm_flags &= ~(VM_MAYWRITE | VM_SHARED);
 
 			/* fall through */
 		case MAP_PRIVATE:
+            /*私人映射请求
+            判断映射文件是否有可读属性，如果没有则直接return*/
 			if (!(file->f_mode & FMODE_READ))
 				return -EACCES;
+            /*判断是否位mount挂在文件属性，如果是当vm_flags如果有
+            可执行属性则直接return ，如果没有则mayexec将被删除*/
 			if (path_noexec(&file->f_path)) {
 				if (vm_flags & VM_EXEC)
 					return -EPERM;
 				vm_flags &= ~VM_MAYEXEC;
 			}
-
+            /*判断是否映射成功，如果映射失败则直接return*/
 			if (!file->f_op->mmap)
 				return -ENODEV;
+            /*判断是否有grosdown和grossup属性，如果存在则返回-EINVAL错误。*/
 			if (vm_flags & (VM_GROWSDOWN|VM_GROWSUP))
 				return -EINVAL;
 			break;
@@ -1486,8 +1521,10 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			return -EINVAL;
 		}
 	} else {
+	    /*此时映射方是内存匿名映射，不是文件映射*/
 		switch (flags & MAP_TYPE) {
 		case MAP_SHARED:
+            /*对于共享的匿名映射，请添加pgoff = 0，shared和maysahre标志。但是，如果请求grosdown或grossup，则返回-EINVAL错误*/
 			if (vm_flags & (VM_GROWSDOWN|VM_GROWSUP))
 				return -EINVAL;
 			/*
@@ -1500,6 +1537,7 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			/*
 			 * Set pgoff according to addr for anon_vma.
 			 */
+			/*在私有匿名映射的情况下，虚拟地址页号分配给pgoff*/
 			pgoff = addr >> PAGE_SHIFT;
 			break;
 		default:
@@ -1511,6 +1549,9 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	 * Set 'VM_NORESERVE' if we should not account for the
 	 * memory use of this mapping.
 	 */
+	/*
+	没有保留请求的情况下，如果过量提交模式不是OVERCOMMIT_NEVER，或者它是一个巨大的页面文件，则会添加vm_noreserve标志
+    */
 	if (flags & MAP_NORESERVE) {
 		/* We honor MAP_NORESERVE if allowed to overcommit */
 		if (sysctl_overcommit_memory != OVERCOMMIT_NEVER)
@@ -1520,7 +1561,8 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 		if (file && is_file_hugepages(file))
 			vm_flags |= VM_NORESERVE;
 	}
-
+    
+    /*从pgoff页到虚拟地址addr，使用len来使用vm_flags属性配置和注册vma*/
 	addr = mmap_region(file, addr, len, vm_flags, pgoff, uf);
 	if (!IS_ERR_VALUE(addr) &&
 	    ((vm_flags & VM_LOCKED) ||
@@ -1644,6 +1686,7 @@ int vma_wants_writenotify(struct vm_area_struct *vma, pgprot_t vm_page_prot)
  * We account for memory if it's a private writeable mapping,
  * not hugepages and VM_NORESERVE wasn't set.
  */
+/*检查负责的映射（私有可写映射）它不是一个巨大的文件映射，没有noreserve或共享，也没有写请求*/
 static inline int accountable_mapping(struct file *file, vm_flags_t vm_flags)
 {
 	/*
@@ -1667,6 +1710,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	unsigned long charged = 0;
 
 	/* Check against address space limit. */
+     /*当前任务的vm页总数超过了地址空间限制(RLIMIT_AS)。如果是则需要释放掉重叠的空间地址*/
 	if (!may_expand_vm(mm, vm_flags, len >> PAGE_SHIFT)) {
 		unsigned long nr_pages;
 
@@ -1675,13 +1719,14 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 		 * requested mapping. Account for the pages it would unmap.
 		 */
 		nr_pages = count_vma_pages_range(mm, addr, addr + len);
-
+        /*修复映射的情况下，减去并映射重叠区域。如果与现有区域不重叠的页面不可扩展，则返回-ENOMEM错误*/
 		if (!may_expand_vm(mm, vm_flags,
 					(len >> PAGE_SHIFT) - nr_pages))
 			return -ENOMEM;
 	}
 
 	/* Clear old maps */
+    /*清理未映射与请求区域重叠的现有区域*/
 	while (find_vma_links(mm, addr, addr + len, &prev, &rb_link,
 			      &rb_parent)) {
 		if (do_munmap(mm, addr, len, uf))
@@ -1691,6 +1736,8 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	/*
 	 * Private writable mapping: check memory availability
 	 */
+	/*检查请求的映射它不是一个巨大的文件映射，如果是则直接return 0，
+	如果不是则检查没有noreserve或共享，也没有写请求*/
 	if (accountable_mapping(file, vm_flags)) {
 		charged = len >> PAGE_SHIFT;
 		if (security_vm_enough_memory_mm(mm, charged))
@@ -1701,6 +1748,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	/*
 	 * Can we just expand an old mapping?
 	 */
+	/*如果现有的vma使用私有匿名映射，请检查它是否可以合并和扩展，如果可能，请移至out标签*/
 	vma = vma_merge(mm, prev, addr, addr + len, vm_flags,
 			NULL, file, pgoff, NULL, NULL_VM_UFFD_CTX);
 	if (vma)
@@ -1711,6 +1759,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	 * specific mapper. the address has already been validated, but
 	 * not unmapped, but the maps are removed from the list.
 	 */
+	/*为vma结构分配内存，并且在失败时，将已经增加的vm commit页面的数量恢复到原始状态，并返回-ENOMEM错误*/
 	vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
 	if (!vma) {
 		error = -ENOMEM;
@@ -1725,12 +1774,15 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	vma->vm_pgoff = pgoff;
 	INIT_LIST_HEAD(&vma->anon_vma_chain);
 
+    /*判断是否位文件映射如果是则进入该循环完成文件映射相关的属性确认*/
 	if (file) {
+        /*当有拒绝写入请求时，该文件被设为拒绝写入。如果失败，则转到free_vma标签*/
 		if (vm_flags & VM_DENYWRITE) {
 			error = deny_write_access(file);
 			if (error)
 				goto free_vma;
 		}
+        /*如果存在共享请求，则将对映射区域的下一个可写文件映射请求设置为拒绝。如果失败，它将移至allow_write_and_free_vma标签。*/
 		if (vm_flags & VM_SHARED) {
 			error = mapping_map_writable(file->f_mapping);
 			if (error)
@@ -1742,7 +1794,11 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 		 * and map writably if VM_SHARED is set. This usually means the
 		 * new file must not have been exposed to user-space, yet.
 		 */
+		/*
+		获取请求映射的文件的f_count值，并将这个值分配给vma_vm_file
+        */
 		vma->vm_file = get_file(file);
+        /*文件与vma地址建立映射关系，将vma与文件链接起来，如果失败，则转到unmap_and_free_vma标签*/
 		error = call_mmap(file, vma);
 		if (error)
 			goto unmap_and_free_vma;
@@ -1755,10 +1811,14 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 		 *      be updated for vma_link()
 		 */
 		WARN_ON_ONCE(addr != vma->vm_start);
-
+        /*将vma虚拟地址的起始地址赋给addr，并将vm_flags赋给vm_flags,供用户空间使用*/
 		addr = vma->vm_start;
 		vm_flags = vma->vm_flags;
 	} else if (vm_flags & VM_SHARED) {
+        /*
+        准备共享的匿名映射。如果失败，则转到free_vma标签。
+        将“ /dev/zero”文件分配给vma->vm_file，将全局shmem_vm_ops分配给vma->vm_ops
+        */
 		error = shmem_zero_setup(vma);
 		if (error)
 			goto free_vma;
@@ -1775,8 +1835,11 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	file = vma->vm_file;
 out:
 	perf_event_mmap(vma);
-
+    /*对于内存描述符，按len个页面添加一些虚拟内存的vm stat计数器*/
 	vm_stat_account(mm, vm_flags, len >> PAGE_SHIFT);
+    /*mlock（VM_LOCKED）请求，如果有巨大的页面或Gate vma请求，
+    则VM_SPECIAL删除VM_LOCKED标志。如果没有，则将len个页面添加到mm-> locked_vm
+    */
 	if (vm_flags & VM_LOCKED) {
 		if (!((vm_flags & VM_SPECIAL) || is_vm_hugetlb_page(vma) ||
 					vma == get_gate_vma(current->mm)))
@@ -1784,7 +1847,7 @@ out:
 		else
 			vma->vm_flags &= VM_LOCKED_CLEAR_MASK;
 	}
-
+    /*文件映射的情况下，如果设置了uprobe，并且uprobe过滤器链挂起，请使用断点命令代码更新请求地址*/
 	if (file)
 		uprobe_mmap(vma);
 
@@ -1795,12 +1858,14 @@ out:
 	 * then new mapped in-place (which must be aimed as
 	 * a completely new data area).
 	 */
+	/*添加softdirty标志，将其写入vma，然后正常返回虚拟地址*/
 	vma->vm_flags |= VM_SOFTDIRTY;
 
 	vma_set_page_prot(vma);
 
 	return addr;
 
+    /*执行要取消映射*/
 unmap_and_free_vma:
 	vma->vm_file = NULL;
 	fput(file);
@@ -1810,11 +1875,13 @@ unmap_and_free_vma:
 	charged = 0;
 	if (vm_flags & VM_SHARED)
 		mapping_unmap_writable(file->f_mapping);
+    
+    /*当存在拒绝写入请求时，allow_write_and_free_vma：标签会增加索引节点的i_writecount*/
 allow_write_and_free_vma:
 	if (vm_flags & VM_DENYWRITE)
 		allow_write_access(file);
 free_vma:
-	kmem_cache_free(vm_area_cachep, vma);
+	kmem_cache_free(vm_area_cachep, vma);//释放了vma对象
 unacct_error:
 	if (charged)
 		vm_unacct_memory(charged);
