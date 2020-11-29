@@ -261,6 +261,9 @@ static void __do_kernel_fault(unsigned long addr, unsigned int esr,
 	 * Are we prepared to handle this kernel fault?
 	 * We are almost certainly not prepared to handle instruction faults.
 	 */
+	/*不是内核指令异常，即便是用户态异常对于内核而言也不会导致异常直接return退出
+	如果在内核态访问用户态地址空间则是否会导致错误，造成漏洞？？？？？？？？？？？
+	*/
 	if (!is_el1_instruction_abort(esr) && fixup_exception(regs))
 		return;
 
@@ -268,24 +271,26 @@ static void __do_kernel_fault(unsigned long addr, unsigned int esr,
 	 * No handler, we'll have to terminate things with extreme prejudice.
 	 */
 	bust_spinlocks(1);
-
+ 
 	if (is_permission_fault(esr, regs, addr)) {
+        /*内核权限错误，请选择该消息，操作只读空间导致错误，或者是读取不可读地址空间数据导致异常*/
 		if (esr & ESR_ELx_WNR)
 			msg = "write to read-only memory";
 		else
 			msg = "read from unreadable memory";
 	} else if (addr < PAGE_SIZE) {
-		msg = "NULL pointer dereference";
+		msg = "NULL pointer dereference";//访问空指针导致异常
 	} else {
-		msg = "paging request";
+		msg = "paging request";//呼叫请求
 	}
-
+    /*打印内核异常信息以及访问的addr地址空间*/
 	pr_alert("Unable to handle kernel %s at virtual address %08lx\n", msg,
 		 addr);
 
-	mem_abort_decode(esr);
+	mem_abort_decode(esr);//内存中止信息
 
-	show_pte(addr);
+	show_pte(addr);//打印页表项内容
+	/*Oops die打印，包括modules、pt_regs、stack、backtrace、mem等信息*/
 	die("Oops", regs, esr);
 	bust_spinlocks(0);
 	do_exit(SIGKILL);
@@ -303,16 +308,21 @@ static void __do_user_fault(struct task_struct *tsk, unsigned long addr,
 	const struct fault_info *inf;
 	unsigned int lsb = 0;
 
+    /*
+    如果未处理信号属于当前进程，且显示信号限制速率则进入该循环
+    */
 	if (unhandled_signal(tsk, sig) && show_unhandled_signals_ratelimited()) {
+        /*获取异常类型，显示异常信息包括进程名称，pid，异常类型，信号，addr地址空间等*/
 		inf = esr_to_fault_info(esr);
 		pr_info("%s[%d]: unhandled %s (%d) at 0x%08lx, esr 0x%03x",
 			tsk->comm, task_pid_nr(tsk), inf->name, sig,
 			addr, esr);
 		print_vma_addr(KERN_CONT ", in ", regs->pc);
 		pr_cont("\n");
-		__show_regs(regs);
+		__show_regs(regs);//打印页表项内容
 	}
 
+    /*异常地址，异常类型，异常信号，异常代号，地址初始化*/
 	tsk->thread.fault_address = addr;
 	tsk->thread.fault_code = esr;
 	si.si_signo = sig;
@@ -330,6 +340,7 @@ static void __do_user_fault(struct task_struct *tsk, unsigned long addr,
 		lsb = PAGE_SHIFT;
 	si.si_addr_lsb = lsb;
 
+    /*发生信号杀死该进程*/
 	force_sig_info(sig, &si, tsk);
 }
 
@@ -358,11 +369,12 @@ static int __do_page_fault(struct mm_struct *mm, unsigned long addr,
 {
 	struct vm_area_struct *vma;
 	int fault;
-
+    /*从mm中根据addr查找对应的虚拟地址空间，如果判断地址空间为空则直接out*/
 	vma = find_vma(mm, addr);
 	fault = VM_FAULT_BADMAP;
 	if (unlikely(!vma))
 		goto out;
+    /*判断vma其实地址释放大于addr，如果不是则跳转到check_stack，尝试扩展堆栈*/
 	if (unlikely(vma->vm_start > addr))
 		goto check_stack;
 
@@ -375,15 +387,20 @@ good_area:
 	 * Check that the permissions on the VMA allow for the fault which
 	 * occurred.
 	 */
+	/*
+	判断vma区域请求的属性时，返回VM_FAULT_BADACCESS结果
+    这是当vma空间不支持vm标志（VM_READ，VM_WRITE，VM_EXEC等）时直接return VM_FAULT_BADACCESS
+    确认访问异常
+    */
 	if (!(vma->vm_flags & vm_flags)) {
 		fault = VM_FAULT_BADACCESS;
 		goto out;
 	}
-
+    /*完成了体系结构mm的错误处理。此后，将执行以与体系结构无关的代码编写的通用mm故障例程*/
 	return handle_mm_fault(vma, addr & PAGE_MASK, mm_flags);
 
 check_stack:
-	if (vma->vm_flags & VM_GROWSDOWN && !expand_stack(vma, addr))
+	if (vma->vm_flags & VM_GROWSDOWN && !expand_stack(vma, addr))//堆栈空间扩展
 		goto good_area;
 out:
 	return fault;
@@ -407,33 +424,42 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 		return 0;
 
 	tsk = current;
-	mm  = tsk->mm;
+	mm  = tsk->mm;//获取当前进程的管理的内存空间mm
 
 	/*
 	 * If we're in an interrupt or have no user context, we must not take
 	 * the fault.
 	 */
+	/*irq上下文中发生错误，或者该进程mm == NULL为空则说明该进程为内核态进程，则跳转到no_context
+	执行__do_kernel_fault(addr, esr, regs);处理该内核进程，如果不是则是说明该进程是一个用户态进程。
+	*/
 	if (faulthandler_disabled() || !mm)
 		goto no_context;
-
+    
+    /*判断是否为用户态进程发生page fault，如果是则添加FAULT_FLAG_USER标志位*/
 	if (user_mode(regs))
 		mm_flags |= FAULT_FLAG_USER;
-
+    
+    /*在用户模式下发生指令终止错误，则将VM_EXEC替换为vm标志*/
 	if (is_el0_instruction_abort(esr)) {
 		vm_flags = VM_EXEC;
 	} else if ((esr & ESR_ELx_WNR) && !(esr & ESR_ELx_CM)) {
+	    /*在尝试写入时发生故障，则将VM_WRITE替换为vm标志，并将FAULT_FLAG_WRITE添加到mm标志*/
 		vm_flags = VM_WRITE;
 		mm_flags |= FAULT_FLAG_WRITE;
 	}
-
+    /*如果进程addr小于TASK_SIZE，且发生权限访问异常时进入该循环进行进一步判断确认*/
 	if (addr < TASK_SIZE && is_permission_fault(esr, regs, addr)) {
 		/* regs->orig_addr_limit may be 0 if we entered from EL0 */
+        /*没有内存限制,导致异常*/
 		if (regs->orig_addr_limit == KERNEL_DS)
 			die("Accessing user space memory with fs=KERNEL_DS", regs, esr);
-
+        
+        /*内核态指令操作导致异常*/
 		if (is_el1_instruction_abort(esr))
 			die("Attempting to execute userspace memory", regs, esr);
 
+        /*搜索异常向量表，确实上报异常是否存在*/
 		if (!search_exception_tables(regs->pc))
 			die("Accessing user space memory outside uaccess.h routines", regs, esr);
 	}
@@ -445,12 +471,18 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 	 * validly references user space from well defined areas of the code,
 	 * we can bug out early if this is from code which shouldn't.
 	 */
+	/*尝试给该内存加锁，如果加锁失败则进入如下判断*/
 	if (!down_read_trylock(&mm->mmap_sem)) {
+        /*该进程是否为用户态进程，如果不是用户态进程并且在异常表中没有注册任何异常，则判定该进程为内核态进程跳转到no_context
+        执行__do_kernel_fault*/
 		if (!user_mode(regs) && !search_exception_tables(regs->pc))
 			goto no_context;
 retry:
-		down_read(&mm->mmap_sem);
+		down_read(&mm->mmap_sem);//重试，获取读锁
 	} else {
+        /*如果获取锁成功则进一步判断，如果在没有竞争条件的情况下获取了锁定，则首先执行提示点。
+          如果对于优先选项之一的自愿内核配置，则需要发生进程的调度先休眠低优先级进程以优先处理更高优先级的任务
+        */
 		/*
 		 * The above down_read_trylock() might have succeeded in which
 		 * case, we'll have missed the might_sleep() from down_read().
@@ -461,10 +493,10 @@ retry:
 			goto no_context;
 #endif
 	}
-
+    /*调用__do_page_fault（）函数来处理页面错误，然后获取错误结果*/
 	fault = __do_page_fault(mm, addr, mm_flags, vm_flags, tsk);
-	major |= fault & VM_FAULT_MAJOR;
-
+	major |= fault & VM_FAULT_MAJOR;//如果故障结果中存在VM_FAULT_MAJOR标志，则也将其添加到major。
+    /*判断do_page_fault处理结果是否需要retry重新操作，如果需要则进入该循环重新操作*/
 	if (fault & VM_FAULT_RETRY) {
 		/*
 		 * If we need to retry but a fatal signal is pending,
@@ -472,6 +504,8 @@ retry:
 		 * the mmap_sem because it would already be released
 		 * in __lock_page_or_retry in mm/filemap.c.
 		 */
+		/*如果有致命信号挂起该进程，且该进程为用户模式下发生故障，则返回0；
+		    如果在内核模式下发生故障，跳转到no_context*/
 		if (fatal_signal_pending(current)) {
 			if (!user_mode(regs))
 				goto no_context;
@@ -482,17 +516,19 @@ retry:
 		 * Clear FAULT_FLAG_ALLOW_RETRY to avoid any risk of
 		 * starvation.
 		 */
+		/*如果该进程并未被致命信号挂起，判断该flag是否需要retry，如果需要则跳转到retry重新操作*/
 		if (mm_flags & FAULT_FLAG_ALLOW_RETRY) {
 			mm_flags &= ~FAULT_FLAG_ALLOW_RETRY;
 			mm_flags |= FAULT_FLAG_TRIED;
 			goto retry;
 		}
 	}
-	up_read(&mm->mmap_sem);
+	up_read(&mm->mmap_sem);//释放retry处获取到的锁
 
 	/*
 	 * Handle the "normal" (no error) case first.
 	 */
+	/*内存访问正常没有错误则return 0*/
 	if (likely(!(fault & (VM_FAULT_ERROR | VM_FAULT_BADMAP |
 			      VM_FAULT_BADACCESS)))) {
 		/*
@@ -518,9 +554,11 @@ retry:
 	 * If we are in kernel mode at this point, we have no context to
 	 * handle this fault with.
 	 */
+	/*如果内核态进程发生错误，导致内核导致异常则跳转到__do_kernel_fault完成错误处理*/
 	if (!user_mode(regs))
 		goto no_context;
-
+    /*发生OOM（内存不足）异常，它将执行OOM终止并返回正常结果（0）
+      通过杀死具有较高OOM分数的用户任务来释放内存*/
 	if (fault & VM_FAULT_OOM) {
 		/*
 		 * We ran out of memory, call the OOM killer, and return to
@@ -530,7 +568,7 @@ retry:
 		pagefault_out_of_memory();
 		return 0;
 	}
-
+    /**/
 	if (fault & VM_FAULT_SIGBUS) {
 		/*
 		 * We had some memory, but were unable to successfully fix up
@@ -550,12 +588,12 @@ retry:
 		code = fault == VM_FAULT_BADACCESS ?
 			SEGV_ACCERR : SEGV_MAPERR;
 	}
-
+    /*执行du_user_fault处理用户进程异常*/
 	__do_user_fault(tsk, addr, esr, sig, code, regs, fault);
 	return 0;
 
 no_context:
-	__do_kernel_fault(addr, esr, regs);
+	__do_kernel_fault(addr, esr, regs);//处理内核态进程访问异常
 	return 0;
 }
 
