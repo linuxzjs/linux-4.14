@@ -3212,6 +3212,9 @@ static int __do_fault(struct vm_fault *vmf)
 	 *				unlock_page(B)
 	 *				# flush A, B to clear the writeback
 	 */
+	/*如果pmd位空，且prealloc_pte同样位空则，使用pte_alloc_pte分配一个新的page出来，并将地址赋给vmf->prealloc_pte
+	判断如果分配失败则说明物理页面不足，直接触发OOM释放物理页面
+    */
 	if (pmd_none(*vmf->pmd) && !vmf->prealloc_pte) {
 		vmf->prealloc_pte = pte_alloc_one(vmf->vma->vm_mm,
 						  vmf->address);
@@ -3219,7 +3222,10 @@ static int __do_fault(struct vm_fault *vmf)
 			return VM_FAULT_OOM;
 		smp_wmb(); /* See comment in __pte_alloc() */
 	}
-
+    /*
+    执行文件映射错误处理函数，相当于filemap_fault函数在filemap.c文件当中
+    从文件读取的页面信息并传输到输出参数页面
+    */
 	ret = vma->vm_ops->fault(vmf);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY |
 			    VM_FAULT_DONE_COW)))
@@ -3566,20 +3572,53 @@ static int do_fault_around(struct vm_fault *vmf)
 	pgoff_t end_pgoff;
 	int off, ret = 0;
 
+    /*
+    使用fault_around_bytes常规情况下是65536bit也就是64K，经过fault_around_bytes >> PAGE_SHIFT偏移可以得出nr_pages = 16也就是16个pages
+    所以nr_pages是根据fault_around_bytes的变化而改变的。
+    */
 	nr_pages = READ_ONCE(fault_around_bytes) >> PAGE_SHIFT;
+    /*
+    获取mask,根据以数据可以获取出mask=0xFFFF_0000,在ARM64位系统当中这个数值将会更大，
+    关键在于过滤掉address后的16位数据，这16位分别是:12位的offset(12位 页内偏移PAGE_SHIFT) + 4(PTE，该寄存器共9位也就是虚拟地址的[21,12]这9位，2^9次方= 512。执行512个物理页面)
+    过滤掉的数值最大也就是0xFFFF,也就是64K，16个pages, PTE被过滤掉的后4位也就决定了这个地址的差值最大也就是16个pagges，也就是64K
+    mask同样也是固定的，取决于nr_pages也就是fault_around_bytes
+    */
 	mask = ~(nr_pages * PAGE_SIZE - 1) & PAGE_MASK;
-
+    /*
+    使用mask做address & mask过滤掉后16位，并与vmf->vma->vm_start比较取最大的值重新赋值给vmf->address
+    */
 	vmf->address = max(address & mask, vmf->vma->vm_start);
+    /*
+    首先需要明确PTRS_PER_PTE的含义:PTRS_PER_PTE代表的是PTE的个数(也就是物理页面的个数pages),在一个虚拟地址当中可以使用或者是指向最大的PTE个数就存放在[21,12]当中，2^9 = 512个pages
+    则与(PTRS_PER_PTE - 1) &做与操作就可以得出此时(address - vmf->address) >> PAGE_SHIFT)的差值是多少个pages,这个pages就取决于PTE的[15, 12]后4位，
+    这样off的最大值也就是2^4 = 16,也就是16个pages。通过((address - vmf->address) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1)就可以计算出最大的一个off差值，
+    计算出实际地址与可映射地址之间的最大偏差页数。保证了计算出来的off要大于实际的物理地址映射范围。
+    */
 	off = ((address - vmf->address) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
+    /*start_pgoff = start_pgoff - off 就得到了一个最小的start_pgoff，同样start_pgoff也小于实际的pgoff，这样就会多映射了一定的地址空间，减少出现fault的次数。*/
 	start_pgoff -= off;
 
 	/*
 	 *  end_pgoff is either end of page table or end of vma
 	 *  or fault_around_pages() from start_pgoff, depending what is nearest.
 	 */
+	/*
+	(1) = (PTRS_PER_PTE - 1)代表一个虚拟地址可以使用的最大的PTE个数(也就是512个物理pages)512 pages
+    (2) = (vmf->address >> PAGE SHIE)&(PTRS_PER_PTE - 1)) 代表vmf已经使用了多少个PTE，也就是多少个物理页面pages,
+    (3) = start_pgoff 代表了PTE的起始地址, 从该PTE向上增长。
+    对于 end_pgoff = (1) - (2) + (3)可能更好理解,(1) - (2)可以得出该虚拟地址空间还剩下多少个可用的PTE也就是剩下的物理地址空间个数
+    在这个基础上加上(3)就可以得到最大的映射结束地址也就是end_pgoff。这里将end_pgoff修改为max_pgoff可能更为贴切，更方便理解。
+    */
 	end_pgoff = start_pgoff -
 		((vmf->address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1)) +
 		PTRS_PER_PTE - 1;
+    /*
+    (1) end_pgoff 是计算出来的max_pgoff地址。
+    (2) (vma_pages(vmf->vma) + vmf->vma->vm_pgoff - 1) = (vmf->vma->vm_end - vmf->vma->vm_start) + vmf->vma->vm_pgoff - 1
+    (3) start_pgoff + nr_pages - 1 = start_pgoff + 15
+    取最小值用于vmf->vma->vm_ops->map_pages(vmf, start_pgoff, end_pgoff)映射当中，通过这里分析也可以知道
+    end_pgoff - start_pgoff的最大差值是15，也就是0~15这一共16个pages页面也就是64k，从文件的映射当中也就限制了单次映射的最大地址空间就是64K。
+    */
 	end_pgoff = min3(end_pgoff, vma_pages(vmf->vma) + vmf->vma->vm_pgoff - 1,
 			start_pgoff + nr_pages - 1);
 
@@ -3590,20 +3629,26 @@ static int do_fault_around(struct vm_fault *vmf)
 			goto out;
 		smp_wmb(); /* See comment in __pte_alloc() */
 	}
-
+    /*vmf文件与start_pgoff，end_pgoff建立映射关系*/
 	vmf->vma->vm_ops->map_pages(vmf, start_pgoff, end_pgoff);
-
+    
 	/* Huge page is mapped? Page fault is solved */
+    /*如果这是也给huge，巨型页面则这个fault将被解决，并返回NOPAGE*/
 	if (pmd_trans_huge(*vmf->pmd)) {
 		ret = VM_FAULT_NOPAGE;
 		goto out;
 	}
 
 	/* ->map_pages() haven't done anything useful. Cold page cache? */
+    /*如果vmf->pte为空则跳转到out，返回为NULL*/
 	if (!vmf->pte)
 		goto out;
 
 	/* check if the page fault is solved */
+    /*
+    如果pte不为0， 映射后的vmf->address - address(映射前的vmf->address)经过PAGE_SHIFT偏移后就可以得出成功建立映射的pages个数
+    pte = pet - pages，如果pte不为空则说明这个映射是成功的，没有越界等其他问题，此时返回VM_FAULT_NOPAGE表示vmf文件映射成功完成，
+    */
 	vmf->pte -= (vmf->address >> PAGE_SHIFT) - (address >> PAGE_SHIFT);
 	if (!pte_none(*vmf->pte))
 		ret = VM_FAULT_NOPAGE;
@@ -3613,7 +3658,7 @@ out:
 	vmf->pte = NULL;
 	return ret;
 }
-
+/*读文件fault错误*/
 static int do_read_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
@@ -3624,16 +3669,21 @@ static int do_read_fault(struct vm_fault *vmf)
 	 * if page by the offset is not ready to be mapped (cold cache or
 	 * something).
 	 */
+	/*
+	通过基于文件基数树管理的页面缓存中请求的虚拟地址，通过在fault_around_bytes（64K）范围内获取和映射页面来进行映射
+	这样做的目的是在预先加载周围的页面时减少页错误异常的次数，同时起到一定的文件映射保护作用，单次的最大映射空间被限制在64K，有一定的保护作用。
+    */
 	if (vma->vm_ops->map_pages && fault_around_bytes >> PAGE_SHIFT > 1) {
 		ret = do_fault_around(vmf);
 		if (ret)
 			return ret;
 	}
-
+    /*从文件vmf当中读取页内容*/
 	ret = __do_fault(vmf);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		return ret;
-
+    
+    /*设置并更新虚拟地址的页表项*/
 	ret |= finish_fault(vmf);
 	unlock_page(vmf->page);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
@@ -3721,6 +3771,12 @@ static int do_shared_fault(struct vm_fault *vmf)
  * The mmap_sem may have been released depending on flags and our
  * return value.  See filemap_fault() and __lock_page_or_retry().
  */
+/*文件映射操作
+在用作文件映射类型的vma区域中发生故障时，将其视为以下三种类型。
+如果没有写许可请求，则读取并映射页面缓存中的页面。如果它不在页面缓存中，它将从文件中读取并再次将其存储在页面缓存中。
+只读当请求非共享文件的写入权限时，它将读取该文件，将其存储在页面高速缓存中，然后将其复制到新页面上，并通过授予对该页面的写入权限来映射一个匿名对象。
+如果请求只读共享文件的写许可权，请设置写许可权。
+*/
 static int do_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
@@ -3729,6 +3785,15 @@ static int do_fault(struct vm_fault *vmf)
 	/*
 	 * The VMA was not fully populated on mmap() or missing VM_DONTEXPAND
 	 */
+	/*如果映射的设备或文件系统中不支持vm_ops-> fault hook函数时，就是这种情况。
+    处理PTE条目的取消映射。
+    在32位系统上，提供了将pte条目映射到highmem的选项。仅在这种情况下，当不使用pte表时应执行取消映射处理。
+    在64位系统中，由于pte条目始终使用维护映射状态的普通内存，因此不会执行单独的取消映射。
+    如果使用了CONFIG_HIGHPTE内核选项，则可以将pte条目分配给highmem并使用。
+    故障处理如下。
+    如果尚未准备好pmd条目，则返回VM_FAULT_SIGBUS错误。
+    如果没有与故障地址相对应的pte条目值，则返回VM_FAULT_SIGBUS，如果有，则返回VM_FAULT_NOPAGE
+    */
 	if (!vma->vm_ops->fault) {
 		/*
 		 * If we find a migration pmd entry or a none pmd entry, which
@@ -3756,11 +3821,11 @@ static int do_fault(struct vm_fault *vmf)
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 		}
 	} else if (!(vmf->flags & FAULT_FLAG_WRITE))
-		ret = do_read_fault(vmf);
+		ret = do_read_fault(vmf);//没有写请求，则调用do_read_fault（）函数以从映射文件中读取页面，造成读文件错误
 	else if (!(vma->vm_flags & VM_SHARED))
-		ret = do_cow_fault(vmf);
+		ret = do_cow_fault(vmf);//没有共享方式，则do_cow_fault（）函数以复制并写入新页面，相当于写私有文件
 	else
-		ret = do_shared_fault(vmf);
+		ret = do_shared_fault(vmf);//如果是共享文件映射调用do_shared_fault（）函数以设置写操作，相当于写共享文件
 
 	/* preallocated pagetable is unused: free it */
 	if (vmf->prealloc_pte) {
@@ -3942,10 +4007,19 @@ static int wp_huge_pud(struct vm_fault *vmf, pud_t orig_pud)
  * The mmap_sem may have been released depending on flags and our return value.
  * See filemap_fault() and __lock_page_or_retry().
  */
+/*
+在用作文件映射类型的vma区域中发生故障时，将处理与文件相关的故障。
+如果在vma区域中用作匿名类型发生故障，则将映射一个新页面，并将反向映射管理添加到反向匿名中。
+如果交换的anon页面中发生故障，将从交换文件中读取一个新页面。
+写保护如果尝试写入映射的共享内存时发生错误，请将页面复制到新页面并映射写入。
+Numa页面迁移
+如果numa平衡出现故障，则会迁移页面。
+
+*/
 static int handle_pte_fault(struct vm_fault *vmf)
 {
 	pte_t entry;
-
+    /*如果pmd为空，所以设置vmf-> pte=NULL*/
 	if (unlikely(pmd_none(*vmf->pmd))) {
 		/*
 		 * Leave __pte_alloc() until later: because vm_ops->fault may
@@ -3955,6 +4029,11 @@ static int handle_pte_fault(struct vm_fault *vmf)
 		 */
 		vmf->pte = NULL;
 	} else {
+	    /*
+	    存在pmd条目的情况。在vmf-> pte中获取pte条目。
+	    但是，在以pmd为单位操作的设备存储器或以pmd为单位操作的thp的情况下，
+	    由于不需要进行任何进一步操作，因此返回0。
+        */
 		/* See comment in pte_alloc_one_map() */
 		if (pmd_devmap_trans_unstable(vmf->pmd))
 			return 0;
@@ -3964,6 +4043,9 @@ static int handle_pte_fault(struct vm_fault *vmf)
 		 * mmap_sem read mode and khugepaged takes it in write mode.
 		 * So now it's safe to run pte_offset_map().
 		 */
+		/*
+		从pmd当中通过address偏移得到pte也就是找到了物理地址空间
+        */
 		vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
 		vmf->orig_pte = *vmf->pte;
 
@@ -3976,35 +4058,49 @@ static int handle_pte_fault(struct vm_fault *vmf)
 		 * ptl lock held. So here a barrier will do.
 		 */
 		barrier();
+        /*判断pte是否被使用，如果不存在则接触相关映射并设置PTE = NULL为空*/
 		if (pte_none(vmf->orig_pte)) {
 			pte_unmap(vmf->pte);
 			vmf->pte = NULL;
 		}
 	}
-
+    /*
+    PTE为空：则vma_is_anonymous判断映射类型
+    如果使用匿名映射时，将通过调用do_anonymous_page（）函数来分配和映射新页面。此方法称为惰性页面分配
+    如果使用文件映射时，请调用do_fault（）函数从file读取页面
+    */
 	if (!vmf->pte) {
 		if (vma_is_anonymous(vmf->vma))
 			return do_anonymous_page(vmf);
 		else
 			return do_fault(vmf);
 	}
-
+    /*判断PTE是否存在如果不存在则调用do_swap_page（）来加载交换的页面*/
 	if (!pte_present(vmf->orig_pte))
 		return do_swap_page(vmf);
-
+    
+    /*NUMA平衡发生故障，则调用do_numa_page（）函数来迁移页面*/
 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
 		return do_numa_page(vmf);
 
+    /*获取与pmd条目值相对应的页面的ptl（页面表锁定）值，即pte页面表，并执行锁定*/
 	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
 	spin_lock(vmf->ptl);
 	entry = vmf->orig_pte;
 	if (unlikely(!pte_same(*vmf->pte, entry)))
 		goto unlock;
+    /*
+    向页面发出写请求时，条目值将设置为脏。另外，当对写保护条目（即只读共享页面）发出写请求时，将调用do_wp_page（）函数将现有共享页面复制到新页面。
+    当用户向共享内存发出写请求时，现有共享页面将被COW（写时复制）到新页面
+    */
 	if (vmf->flags & FAULT_FLAG_WRITE) {
 		if (!pte_write(entry))
 			return do_wp_page(vmf);
 		entry = pte_mkdirty(entry);
 	}
+    /*
+    pte值和条目值不同，则更新pte表条目值。如果实际进行了更新，则缓存也会被更新。即使值相同且pte表条目值未更新，如果有写入请求，也应执行tlb刷新。
+    */
 	entry = pte_mkyoung(entry);
 	if (ptep_set_access_flags(vmf->vma, vmf->address, vmf->pte, entry,
 				vmf->flags & FAULT_FLAG_WRITE)) {
@@ -4040,25 +4136,39 @@ static int __handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 		.pgoff = linear_page_index(vma, address),
 		.gfp_mask = __get_fault_gfp_mask(vma),
 	};
+    /*将在写入期间是否发生故障的地址设置为脏*/
 	unsigned int dirty = flags & FAULT_FLAG_WRITE;
 	struct mm_struct *mm = vma->vm_mm;
 	pgd_t *pgd;
 	p4d_t *p4d;
 	int ret;
-
+    /*获取发生fault故障虚拟地址相对应的pgd条目*/
 	pgd = pgd_offset(mm, address);
+    /*如果pgd条目为空，则将下一级p4d表分配给连接
+    如果pgd不为空则p4d_offset(pgd, address)获取p4d，且如果p4d为空则启动OOM*/
 	p4d = p4d_alloc(mm, pgd, address);
 	if (!p4d)
 		return VM_FAULT_OOM;
 
+    /*如果p4d条目为空，则将下一级pud表分配给连接
+    如果p4d不为空则相当于pud_offset(p4d, address)获取到pud地址。*/
 	vmf.pud = pud_alloc(mm, p4d, address);
 	if (!vmf.pud)
 		return VM_FAULT_OOM;
+    /*
+    如果pud条目为空，并且满足以pud为单位使用块映射的条件，则会分配一个巨大的pud。
+     对于ARM64，以pud为单位的块映射对应于1G
+    */
 	if (pud_none(*vmf.pud) && transparent_hugepage_enabled(vma)) {
 		ret = create_huge_pud(&vmf);
 		if (!(ret & VM_FAULT_FALLBACK))
 			return ret;
 	} else {
+	    /*
+	    如果将pud条目映射为只读并且尝试写入会发生错误，请在文件映射的文件系统支持（* huge_fault）挂钩的情况下执行此操作。
+	    尚不支持其他命令，例如匿名命令，因此返回VM_FAULT_FALLBACK，因此代码继续。
+        在其他情况下，指示读取的年轻标志记录在pud条目中。另外，如果是写尝试，则还将记录脏标志。
+        */
 		pud_t orig_pud = *vmf.pud;
 
 		barrier();
@@ -4076,17 +4186,23 @@ static int __handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 			}
 		}
 	}
-
+    /*如果pud为空，则将分配下一级pmd表用于连接
+     pud不为空则pmd_offset(pud, address)获取到pmd地址*/
 	vmf.pmd = pmd_alloc(mm, vmf.pud, address);
 	if (!vmf.pmd)
 		return VM_FAULT_OOM;
+    
+    /*
+    如果pmd条目为空，并且满足以pmd为单位使用块映射的条件，则会分配巨大的pmd。
+    对于ARM64，以pmd为单位的块映射对应于2M。
+    */
 	if (pmd_none(*vmf.pmd) && transparent_hugepage_enabled(vma)) {
 		ret = create_huge_pmd(&vmf);
 		if (!(ret & VM_FAULT_FALLBACK))
 			return ret;
 	} else {
 		pmd_t orig_pmd = *vmf.pmd;
-
+        /*存在pmd条目的情况。如果在以低概率交换pmd条目时发生故障，则它是从交换区域加载的。等待一会儿，并返回成功值0*/
 		barrier();
 		if (unlikely(is_swap_pmd(orig_pmd))) {
 			VM_BUG_ON(thp_migration_supported() &&
@@ -4095,6 +4211,13 @@ static int __handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 				pmd_migration_entry_wait(mm, vmf.pmd);
 			return 0;
 		}
+        /*
+        pmd_trans_huge（）函数中，仅当以pmd为单位的thp可行或以pmd为单位的设备存储器映射可行时，才进行以下处理。
+        如果可以访问vma区域，则通过do_huge_pmd_numa_page（）函数处理巨大的pmd。
+        如果pmd条目被映射为只读，并且尝试写入时发生错误，请在文件映射的文件系统支持（* huge_fault）挂钩的情况下执行此操作。
+        尚不支持其他命令，例如匿名命令，因此返回VM_FAULT_FALLBACK，因此代码继续。
+        在其他情况下，会记录指示在pmd条目中已读取的年轻标志。另外，如果是写尝试，则还将记录脏标志
+        */
 		if (pmd_trans_huge(orig_pmd) || pmd_devmap(orig_pmd)) {
 			if (pmd_protnone(orig_pmd) && vma_is_accessible(vma))
 				return do_huge_pmd_numa_page(&vmf, orig_pmd);
@@ -4109,7 +4232,8 @@ static int __handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 			}
 		}
 	}
-
+    /*调用handle_pte_fault（）函数来处理最后的pte错误
+    上述代码其实就是pgd->p4d->pud->pmd->pte的过程，最终找到对应的物理页面，后进入物理页面完成pte的fault操作*/
 	return handle_pte_fault(&vmf);
 }
 
@@ -4124,6 +4248,7 @@ int handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 {
 	int ret;
 
+    /*设置当前进程状态为TASK_RUNNING执行状态*/
 	__set_current_state(TASK_RUNNING);
 
 	count_vm_event(PGFAULT);
@@ -4141,9 +4266,10 @@ int handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	 * Enable the memcg OOM handling for faults triggered in user
 	 * space.  Kernel faults are handled more gracefully.
 	 */
+	/*用户区态发生故障，启动memcg OOM功能*/
 	if (flags & FAULT_FLAG_USER)
 		mem_cgroup_oom_enable();
-
+    /*判断是否为巨型帧，如果是则走hugetlb_fault路径，如果不是则进入__handle_mm_fault*/
 	if (unlikely(is_vm_hugetlb_page(vma)))
 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
 	else
