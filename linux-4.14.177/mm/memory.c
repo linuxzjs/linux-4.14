@@ -2716,8 +2716,14 @@ static int do_wp_page(struct vm_fault *vmf)
 	__releases(vmf->ptl)
 {
 	struct vm_area_struct *vma = vmf->vma;
-
+    /*这是两个过程
+    1. 根据PTE页表项获取页帧号，unsigned long pfn = pte_pfn(pte);
+    2. 在根据页帧号获取到页描述符pfn_to_page(pfn)
+    */
 	vmf->page = vm_normal_page(vma, vmf->address, vmf->orig_pte);
+    /*
+	判断vmf->page是否为空，则进入判断语句如果page不为空则跳过该判断向下执行
+    */
 	if (!vmf->page) {
 		/*
 		 * VM_MIXEDMAP !pfn_valid() case, or VM_SOFTDIRTY clear on a
@@ -2726,6 +2732,14 @@ static int do_wp_page(struct vm_fault *vmf)
 		 * We should not cow pages in a shared writeable mapping.
 		 * Just mark the pages writable and/or call ops->pfn_mkwrite.
 		 */
+		/*
+		vmf->page为0，则说明该page没有建立映射关系，此时、
+		如果(vma->vm_flags & (VM_WRITE|VM_SHARED)) == (VM_WRITE|VM_SHARED)说明这个page是一个共享的页面，则执行wp_pfn_shared
+		此时操作的就是一个共享可写页面，不需要复制物理页面，只需要设置页表权限即可
+		如果(vma->vm_flags & (VM_WRITE|VM_SHARED)) != (VM_WRITE|VM_SHARED)说明该页面是只读页面，这种情况就是当父进程frok一个子进程
+		此时该设置空间地址为只读页面，只有当发生write写操作时才会发生(COW)写时拷贝，分配一个新的page，并建立映射关系wp_page_copy(vmf);
+		此时操作的就是一个私有可写页面，此时复制物理页面(分配物理页面)并将虚拟地址与物理地址之间建立映射关系
+        */
 		if ((vma->vm_flags & (VM_WRITE|VM_SHARED)) ==
 				     (VM_WRITE|VM_SHARED))
 			return wp_pfn_shared(vmf);
@@ -2738,8 +2752,14 @@ static int do_wp_page(struct vm_fault *vmf)
 	 * Take out anonymous pages first, anonymous shared vmas are
 	 * not dirty accountable.
 	 */
+	/*
+	如果page是匿名页面且不是内核相同合并（KSM）.则进入判断
+    */
 	if (PageAnon(vmf->page) && !PageKsm(vmf->page)) {
 		int total_map_swapcount;
+        /*
+        
+        */
 		if (!trylock_page(vmf->page)) {
 			get_page(vmf->page);
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
@@ -2880,18 +2900,27 @@ int do_swap_page(struct vm_fault *vmf)
 	int locked;
 	int exclusive = 0;
 	int ret = 0;
-	bool vma_readahead = swap_use_vma_readahead();
-
+	bool vma_readahead = swap_use_vma_readahead();//预读是否开启
+    /*
+    判断是否开启预读功能，如果开启则预读功能，如果开启读取一个page
+    */
 	if (vma_readahead)
 		page = swap_readahead_detect(vmf, &swap_ra);
+    /*判断vmf->pte与vmf->orig_pte入口地址是否相同，如果不同则进入判断语句当中
+    如果page为空则直接跳转到out处，如果page不为空则，则put_page释放该page后在进入out处*/
 	if (!pte_unmap_same(vma->vm_mm, vmf->pmd, vmf->pte, vmf->orig_pte)) {
 		if (page)
 			put_page(page);
 		goto out;
 	}
-
+    /*获取orig_pte目录对应的swap交换的entry*/
 	entry = pte_to_swp_entry(vmf->orig_pte);
+    /*
+    判断，如果entry不swap交换类型则直接跳过该循环，
+    如果是swap交换类型则，进入改判断
+    */
 	if (unlikely(non_swap_entry(entry))) {
+        /*判断是否为迁移类型，如果是则调用migration_entry_wait完成迁移*/
 		if (is_migration_entry(entry)) {
 			migration_entry_wait(vma->vm_mm, vmf->pmd,
 					     vmf->address);
@@ -3087,6 +3116,7 @@ static int do_anonymous_page(struct vm_fault *vmf)
 	pte_t entry;
 
 	/* File mapping without ->vm_ops ? */
+    /*文件映射标志如果是共享VM_SHARED， 直接return VM_FAULT_SIGBUS*/
 	if (vma->vm_flags & VM_SHARED)
 		return VM_FAULT_SIGBUS;
 
@@ -3100,6 +3130,10 @@ static int do_anonymous_page(struct vm_fault *vmf)
 	 *
 	 * Here we only have down_read(mmap_sem).
 	 */
+	/*
+	分配PTE，并判断释放分配成功，如果失败则直接return VM_FAULT_OOM
+	如果成功则将新分配的PTE加入到PMD当中。
+    */
 	if (pte_alloc(vma->vm_mm, vmf->pmd, vmf->address))
 		return VM_FAULT_OOM;
 
@@ -3108,14 +3142,23 @@ static int do_anonymous_page(struct vm_fault *vmf)
 		return 0;
 
 	/* Use the zero-page for reads */
+    /*
+    flags无写权限，就是读权限造成fault,且使用zero-page则进入循环
+    这里对于ARM64来说#define mm_forbids_zeropage(X)	(0)所以!mm_forbids_zeropage(vma->vm_mm)为真
+    这里存在一个疑问就是zeropage是什么？作用是什么？
+    */
 	if (!(vmf->flags & FAULT_FLAG_WRITE) &&
 			!mm_forbids_zeropage(vma->vm_mm)) {
+		/*只读情况直接从zeropage里拿即可，映射现有的零页而不分配单独的页*/
 		entry = pte_mkspecial(pfn_pte(my_zero_pfn(vmf->address),
 						vma->vm_page_prot));
+        /*从vmf->address当中根据pmd获取vmf->pte，并判断vmf->pte是否为空，如果不为空则则跳转到unlock，
+        如果为空则继续向下执行*/
 		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
 				vmf->address, &vmf->ptl);
 		if (!pte_none(*vmf->pte))
 			goto unlock;
+        /*如果vmf->pte为空则，检查vma->vm_mm空间*/
 		ret = check_stable_address_space(vma->vm_mm);
 		if (ret)
 			goto unlock;
@@ -3128,12 +3171,17 @@ static int do_anonymous_page(struct vm_fault *vmf)
 	}
 
 	/* Allocate our own private page. */
+    /*匿名映射进行分配和准备。如果尚未准备就绪，则会返回虚拟内存不足*/
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
+    /*分配一个新的用户page页面，如果存在高内存，则从高内存分配一页作为__GFP_MOVABLE可移动类型
+    如果分配page失败则跳转到oom表明此时页面不足*/
 	page = alloc_zeroed_user_highpage_movable(vma, vmf->address);
 	if (!page)
 		goto oom;
-
+    /*
+    虚拟页数超过了memcg设置的提交配额，则返回虚拟内存不足错误。它主要用于通过使用内存控制组来控制指定任务的内存使用情况
+    */
 	if (mem_cgroup_try_charge(page, vma->vm_mm, GFP_KERNEL, &memcg, false))
 		goto oom_free_page;
 
@@ -3142,17 +3190,27 @@ static int do_anonymous_page(struct vm_fault *vmf)
 	 * preceeding stores to the page contents become visible before
 	 * the set_pte_at() write.
 	 */
-	__SetPageUptodate(page);
-
+	__SetPageUptodate(page);//为新页面设置PG_uptodate标志
+	
+    /*vma区域中设置的页表属性，将page增加到vm_page_prot当中，并返回pte的entry地址*/
 	entry = mk_pte(page, vma->vm_page_prot);
+    /*
+    判断该vma是否有写权限，如果有则将添加pte条目的脏标志，并删除只读标志。
+    pte = set_pte_bit(pte, __pgprot(PTE_WRITE));
+	pte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));
+    */
 	if (vma->vm_flags & VM_WRITE)
 		entry = pte_mkwrite(pte_mkdirty(entry));
 
+    /*
+    锁定对应虚拟地址的pte表页面，并检索pte页表项判断是否为空。如果不为空则机制跳转到release完成整个映射过程。
+    */
 	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
 			&vmf->ptl);
 	if (!pte_none(*vmf->pte))
 		goto release;
-
+    
+    /*如果vmf->pte为空则，检查vma->vm_mm空间*/
 	ret = check_stable_address_space(vma->vm_mm);
 	if (ret)
 		goto release;
@@ -3164,18 +3222,21 @@ static int do_anonymous_page(struct vm_fault *vmf)
 		put_page(page);
 		return handle_userfault(vmf, VM_UFFD_MISSING);
 	}
-
+    /*递增MM_ANONPAGES计数器*/
 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+    /*将page添加到匿名的反向映射当中*/
 	page_add_new_anon_rmap(page, vma, vmf->address, false);
+    /*确认已将页面添加到memcg*/
 	mem_cgroup_commit_charge(page, memcg, false, false);
+    /*将新页面设置为active，并将其添加到lru缓存中，将其添加到lru_add_pvec。*/
 	lru_cache_add_active_or_unevictable(page, vma);
 setpte:
-	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);//映射到
 
 	/* No need to invalidate - it was non-present before */
-	update_mmu_cache(vma, vmf->address, vmf->pte);
+	update_mmu_cache(vma, vmf->address, vmf->pte);//刷新TLB
 unlock:
-	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);//解锁
 	return ret;
 release:
 	mem_cgroup_cancel_charge(page, memcg, false);
@@ -3695,29 +3756,37 @@ static int do_cow_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	int ret;
-
+    /*匿名映射准备，如果准备失败则直接触发OOM*/
 	if (unlikely(anon_vma_prepare(vma)))
 		return VM_FAULT_OOM;
-
+    /*
+    分配一个页面 order = 0, 所以只分配一个物理页面
+    如果分配失败则说明页面不足，返回OOM错误
+    */
 	vmf->cow_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, vmf->address);
 	if (!vmf->cow_page)
 		return VM_FAULT_OOM;
-
+    /*
+    虚拟页数超过了memcg设置的提交配额，则返回虚拟内存不足错误。
+    它主要用于通过使用内存控制组来控制指定任务的内存使用情况。
+    */
 	if (mem_cgroup_try_charge(vmf->cow_page, vma->vm_mm, GFP_KERNEL,
 				&vmf->memcg, false)) {
 		put_page(vmf->cow_page);
 		return VM_FAULT_OOM;
 	}
-
+    /*读取文件，如果结果是错误，无页或重试错误，则该函数通过uncharge_out标签退出*/
 	ret = __do_fault(vmf);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		goto uncharge_out;
 	if (ret & VM_FAULT_DONE_COW)
 		return ret;
-
+    
+    /*文件中读取了请求的页面fault_page，则将其复制到新页面，并为新页面设置PG_uptodate标志。*/
 	copy_user_highpage(vmf->cow_page, vmf->page, vmf->address, vma);
 	__SetPageUptodate(vmf->cow_page);
 
+    /*设置页表项，完成虚拟地址的页表项更新*/
 	ret |= finish_fault(vmf);
 	unlock_page(vmf->page);
 	put_page(vmf->page);
@@ -3734,7 +3803,8 @@ static int do_shared_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	int ret, tmp;
-
+    
+    /*文件缓存中读取错误地址的页面。如果结果是错误，无页或重试错误，则将其放弃并返回结果*/
 	ret = __do_fault(vmf);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		return ret;
@@ -3743,6 +3813,10 @@ static int do_shared_fault(struct vm_fault *vmf)
 	 * Check if the backing address space wants to know that the page is
 	 * about to become writable
 	 */
+	/*
+	vma操作处理程序中设置了page_mkwrite挂钩函数，则将调用do_page_mkwrite（）函数来设置写入。
+	如果失败，则释放fault_page并退出功能
+    */
 	if (vma->vm_ops->page_mkwrite) {
 		unlock_page(vmf->page);
 		tmp = do_page_mkwrite(vmf);
@@ -3752,7 +3826,7 @@ static int do_shared_fault(struct vm_fault *vmf)
 			return tmp;
 		}
 	}
-
+    /*设置页表项，完成虚拟地址的页表项更新*/
 	ret |= finish_fault(vmf);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE |
 					VM_FAULT_RETRY))) {
