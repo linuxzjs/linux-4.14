@@ -2489,10 +2489,14 @@ static int wp_page_copy(struct vm_fault *vmf)
 	const unsigned long mmun_start = vmf->address & PAGE_MASK;
 	const unsigned long mmun_end = mmun_start + PAGE_SIZE;
 	struct mem_cgroup *memcg;
-
+    /*低概率而无法准备anon_vma，它将移至oom*/
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
-
+    
+    /*是否映射zero页面，
+      如果映射了零页，则准备初始化为0的新页。如果由于内存不足而未准备好新页面，则它将移至oom
+      如果不映射zero页面，则alloc_page_vma分配也给新的page页面，并从现有页面复制。如果由于内存不足而未准备好新页面，则它将移至oom
+    */
 	if (is_zero_pfn(pte_pfn(vmf->orig_pte))) {
 		new_page = alloc_zeroed_user_highpage_movable(vma,
 							      vmf->address);
@@ -2503,19 +2507,29 @@ static int wp_page_copy(struct vm_fault *vmf)
 				vmf->address);
 		if (!new_page)
 			goto oom;
+        /*new_page页面分配成功，完成页面复制工作*/
 		cow_user_page(new_page, old_page, vmf->address, vma);
 	}
-
+    /*memcg检查是否超出了新页面的分配限制，如果超过，则移至oom_free_new*/
 	if (mem_cgroup_try_charge(new_page, mm, GFP_KERNEL, &memcg, false))
 		goto oom_free_new;
-
+    
+    /*设置新页面的PG_uptodate标志*/
 	__SetPageUptodate(new_page);
-
+    /*
+    配合
+    const unsigned long mmun_start = vmf->address & PAGE_MASK;
+	const unsigned long mmun_end = mmun_start + PAGE_SIZE;
+    使用新虚拟地址页的地址范围作为参数来调用mmu通知程序列表中注册的invalidate_range_start回调函数
+    */
 	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
 
 	/*
 	 * Re-check the pte - we dropped the lock
 	 */
+    /*获取了页表页的ptl锁之后pte，同过if (likely(pte_same(*vmf->pte, vmf->orig_pte)))
+    判断出pte与orig_pte是相同的说明该pte没有被修改过，不存在与其他进程竞争的问题
+    */
 	vmf->pte = pte_offset_map_lock(mm, vmf->pmd, vmf->address, &vmf->ptl);
 	if (likely(pte_same(*vmf->pte, vmf->orig_pte))) {
 		if (old_page) {
@@ -2527,7 +2541,9 @@ static int wp_page_copy(struct vm_fault *vmf)
 		} else {
 			inc_mm_counter_fast(mm, MM_ANONPAGES);
 		}
+        /*刷新orig_pte页面的cache内容*/
 		flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+        /*准备与新页面相对应的pte条目属性，添加L_PTE_DIRTY，如果在vma中设置了写入，则删除L_PTE_RDONLY*/
 		entry = mk_pte(new_page, vma->vm_page_prot);
 		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
 		/*
@@ -2536,8 +2552,9 @@ static int wp_page_copy(struct vm_fault *vmf)
 		 * seen in the presence of one thread doing SMC and another
 		 * thread doing COW.
 		 */
+		/*取消映射pte条目后，将根据体系结构为页面刷新TLB缓存。然后，调用在mmu通知程序列表中注册的invalidate_range回调函数*/
 		ptep_clear_flush_notify(vma, vmf->address, vmf->pte);
-		page_add_new_anon_rmap(new_page, vma, vmf->address, false);
+		page_add_new_anon_rmap(new_page, vma, vmf->address, false);//创建新的反向映射
 		mem_cgroup_commit_charge(new_page, memcg, false, false);
 		lru_cache_add_active_or_unevictable(new_page, vma);
 		/*
@@ -2545,6 +2562,11 @@ static int wp_page_copy(struct vm_fault *vmf)
 		 * mmu page tables (such as kvm shadow page tables), we want the
 		 * new page to be mapped directly into the secondary page table.
 		 */
+		/*
+		调用mmu通知程序列表中注册的change_pte回调函数后，更改pte条目。
+        链接到mm-> mmu_notifier_mm列表中注册的mn ops处理程序的change_pte回调函数
+        update_mmu_cache该函数在ARM64为架构当中其实是一个空函数
+        */
 		set_pte_at_notify(mm, vmf->address, vmf->pte, entry);
 		update_mmu_cache(vma, vmf->address, vmf->pte);
 		if (old_page) {
@@ -2570,7 +2592,7 @@ static int wp_page_copy(struct vm_fault *vmf)
 			 * mapcount is visible. So transitively, TLBs to
 			 * old page will be flushed before it can be reused.
 			 */
-			page_remove_rmap(old_page, false);
+			page_remove_rmap(old_page, false);//如果page已经存在则，remove移除该page
 		}
 
 		/* Free the old page.. */
@@ -2579,12 +2601,12 @@ static int wp_page_copy(struct vm_fault *vmf)
 	} else {
 		mem_cgroup_cancel_charge(new_page, memcg, false);
 	}
-
-	if (new_page)
+    
+	if (new_page)//如果new_page存在则put_page释放该页面
 		put_page(new_page);
-
-	pte_unmap_unlock(vmf->pte, vmf->ptl);
-	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+    
+	pte_unmap_unlock(vmf->pte, vmf->ptl);//释放页表锁
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);//mmu通知程序列表中注册的invalidate_range_end回调函数
 	if (old_page) {
 		/*
 		 * Don't let another task, with possibly unlocked vma,
@@ -2757,10 +2779,13 @@ static int do_wp_page(struct vm_fault *vmf)
     */
 	if (PageAnon(vmf->page) && !PageKsm(vmf->page)) {
 		int total_map_swapcount;
-        /*
-        
-        */
+        /* 获取该page的PG_locked,如果获取成功则进入该判断*/
 		if (!trylock_page(vmf->page)) {
+            /*
+            获取vmf page，使用pte_offset_map_lock解锁并获取该页面，如果页面vmf->pte失败则put_page(vmf->page)释放该页面，
+            如果pte_offset_map_lock获取页面成功，同时判断vmf->pte与vmf->orig_pte不同，则说明该pte正在被其他进程使用，
+            则解锁该page，同时释放该put_page释放该 page
+            */
 			get_page(vmf->page);
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 			lock_page(vmf->page);
@@ -2774,6 +2799,7 @@ static int do_wp_page(struct vm_fault *vmf)
 			}
 			put_page(vmf->page);
 		}
+        /*判断该page页面是否被重用，*/
 		if (reuse_swap_page(vmf->page, &total_map_swapcount)) {
 			if (total_map_swapcount == 1) {
 				/*
@@ -2786,13 +2812,14 @@ static int do_wp_page(struct vm_fault *vmf)
 				page_move_anon_rmap(vmf->page, vma);
 			}
 			unlock_page(vmf->page);
+            /*设置页被访问，且设置页表项为脏PG_dirty，如果页所在的vma是可写属性则设置页表项值为可写*/
 			wp_page_reuse(vmf);
 			return VM_FAULT_WRITE;
 		}
 		unlock_page(vmf->page);
 	} else if (unlikely((vma->vm_flags & (VM_WRITE|VM_SHARED)) ==
 					(VM_WRITE|VM_SHARED))) {
-		return wp_page_shared(vmf);
+		return wp_page_shared(vmf);//共享可写页面，不需要复制物理页面，只需要设置页表权限即可
 	}
 
 	/*
@@ -2801,6 +2828,7 @@ static int do_wp_page(struct vm_fault *vmf)
 	get_page(vmf->page);
 
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+    /*私有可写  ，复制物理页面，完成虚拟地址与物理地址之间的映射*/
 	return wp_page_copy(vmf);
 }
 
@@ -2917,22 +2945,23 @@ int do_swap_page(struct vm_fault *vmf)
 	entry = pte_to_swp_entry(vmf->orig_pte);
     /*
     判断，如果entry不swap交换类型则直接跳过该循环，
-    如果是swap交换类型则，进入改判断
+    如果是swap交换类型则，进入改判断,进行操作，此时可以推测交换必定伴随着合并，拆分操作
     */
 	if (unlikely(non_swap_entry(entry))) {
-        /*判断是否为迁移类型，如果是则调用migration_entry_wait完成迁移*/
+        /*判断是否为迁移类型，是否与可迁移页面有异曲同工的含义，如果是则调用migration_entry_wait完成迁移*/
 		if (is_migration_entry(entry)) {
 			migration_entry_wait(vma->vm_mm, vmf->pmd,
 					     vmf->address);
-		} else if (is_device_private_entry(entry)) {
+		} else if (is_device_private_entry(entry)) {//在ARM64该流程是为空，这个函数为空
 			/*
 			 * For un-addressable device memory we call the pgmap
 			 * fault handler callback. The callback must migrate
 			 * the page back to some CPU accessible page.
 			 */
+			//arm64架构下该函数为空
 			ret = device_private_entry_fault(vma, vmf->address, entry,
 						 vmf->flags, vmf->pmd);
-		} else if (is_hwpoison_entry(entry)) {
+		} else if (is_hwpoison_entry(entry)) {//在arm64架构下该函数为NULL
 			ret = VM_FAULT_HWPOISON;
 		} else {
 			print_bad_pte(vma, vmf->address, vmf->orig_pte, NULL);
@@ -2941,21 +2970,27 @@ int do_swap_page(struct vm_fault *vmf)
 		goto out;
 	}
 	delayacct_set_flag(DELAYACCT_PF_SWAPIN);
-	if (!page)
+	if (!page)//判断page是否为空，如果page为NULL，则执行lookup_wsap_page根据entry条目，从swap cache中查找可用的page
 		page = lookup_swap_cache(entry, vma_readahead ? vma : NULL,
 					 vmf->address);
+    /*
+    如果查找失败page = NULL，没找到可用的page，则进入if判断语句当中
+    */
 	if (!page) {
+        /*判断是否开启预读功能，如果开启了则使用do_swap_page_readahead，如果没有开启则swapin_readahead从交换文件读取一定数量的页面，包括请求的页面*/
 		if (vma_readahead)
 			page = do_swap_page_readahead(entry,
 				GFP_HIGHUSER_MOVABLE, vmf, &swap_ra);
 		else
 			page = swapin_readahead(entry,
 				GFP_HIGHUSER_MOVABLE, vma, vmf->address);
+        /*如果此时还没有找到page则*/
 		if (!page) {
 			/*
 			 * Back out if somebody else faulted in this pte
 			 * while we released the pte lock.
 			 */
+			/*解锁该页面，同时判断该页面pte是与原始orig_pte相同，如果相同则触发OOM机制*/
 			vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
 					vmf->address, &vmf->ptl);
 			if (likely(pte_same(*vmf->pte, vmf->orig_pte)))
@@ -2965,10 +3000,17 @@ int do_swap_page(struct vm_fault *vmf)
 		}
 
 		/* Had to read the page from swap area: Major fault */
+        /*
+        错误代码被替换为主要故障，并且PGMAJFAULT计数器递增，即使设置了memcg，PGMAJFAULT计数器也递增。
+        当没有从交换缓存中检索出有故障的页面时从交换文件中读取页面时，pgmajfault计数器增加
+        */
 		ret = VM_FAULT_MAJOR;
 		count_vm_event(PGMAJFAULT);
 		count_memcg_event_mm(vma->vm_mm, PGMAJFAULT);
 	} else if (PageHWPoison(page)) {
+        /*
+        hwpoison页面的情况下，将设置hwpoison错误代码，还将删除已设置的DELAYACCT_PF_SWAPIN标志，并且该函数将通过out_release标签退出
+        */
 		/*
 		 * hwpoisoned dirty swapcache pages are kept for killing
 		 * owner processes (which may be unknown at hwpoison time)
@@ -2978,7 +3020,7 @@ int do_swap_page(struct vm_fault *vmf)
 		swapcache = page;
 		goto out_release;
 	}
-
+    /*尝试锁定页面，如果没有，则添加重试错误并通过out_release标签退出该函数*/
 	swapcache = page;
 	locked = lock_page_or_retry(page, vma->vm_mm, vmf->flags);
 
@@ -2994,16 +3036,23 @@ int do_swap_page(struct vm_fault *vmf)
 	 * test below, are not enough to exclude that.  Even if it is still
 	 * swapcache, we need to check that the page's swap has not changed.
 	 */
+	/*判断page是否为交换缓存页面，或者私有页面的私有值与条目值不同，它将移至out_page标签并退出该函数*/
 	if (unlikely(!PageSwapCache(page) || page_private(page) != entry.val))
 		goto out_page;
-
+    /*
+    通过ksm将分配一个新页面并从现有的ksm页面复制该页面，否则，将按原样返回旧页面。如果新页面分配失败，则返回oom错误。
+    ksm的实现原理本质上就是cow写时拷贝操作
+    */
 	page = ksm_might_need_to_copy(page, vma, vmf->address);
 	if (unlikely(!page)) {
 		ret = VM_FAULT_OOM;
 		page = swapcache;
 		goto out_page;
 	}
-
+    /*
+    判断虚拟页数超过了memcg设置的提交配额，则会返回虚拟内存不足错误。
+    它主要用于通过使用内存控制组来控制指定任务的内存使用情况
+    */
 	if (mem_cgroup_try_charge(page, vma->vm_mm, GFP_KERNEL,
 				&memcg, false)) {
 		ret = VM_FAULT_OOM;
@@ -3013,6 +3062,9 @@ int do_swap_page(struct vm_fault *vmf)
 	/*
 	 * Back out if somebody else already faulted in this pte.
 	 */
+	/*
+	锁定相应虚拟地址的pte表页面并获取pte条目，如果它与orig_pte不同，则它已经被映射，因此请离开函数并退出。
+     */
 	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, vmf->address,
 			&vmf->ptl);
 	if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte)))
@@ -3032,9 +3084,13 @@ int do_swap_page(struct vm_fault *vmf)
 	 * before page_add_anon_rmap() and swap_free(); try_to_free_swap()
 	 * must be called after the swap_free(), or it will never succeed.
 	 */
-
+    /*添加了一个匿名页面，并且交换页面已经减少，因此MM_ANONPAGES计数器增加，而MM_SWAPENTS计数器减少*/
 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
 	dec_mm_counter_fast(vma->vm_mm, MM_SWAPENTS);
+    /*通过添加在页面的vma区域中设置的权限属性来创建pte条目
+    如果存在写请求，并且可以重新使用交换缓存，则只需将交换缓存中的COW删除即可，而无需COW，并且页面将按原样转换为anon页面。
+    然后从pte属性中删除只读，设置为dirty以准备，并删除写标志。将VM_FAULT_WRITE添加到返回值，并将独占设置为1
+    */
 	pte = mk_pte(page, vma->vm_page_prot);
 	if ((vmf->flags & FAULT_FLAG_WRITE) && reuse_swap_page(page, NULL)) {
 		pte = maybe_mkwrite(pte_mkdirty(pte), vma);
@@ -3042,22 +3098,28 @@ int do_swap_page(struct vm_fault *vmf)
 		ret |= VM_FAULT_WRITE;
 		exclusive = RMAP_EXCLUSIVE;
 	}
-	flush_icache_page(vma, page);
+	flush_icache_page(vma, page);//刷新页面的指令page
+	/*判断原始orig_pte是否为dirty,设置了软脏标志，则在pte条目中也将设置软脏标志*/
 	if (pte_swp_soft_dirty(vmf->orig_pte))
 		pte = pte_mksoft_dirty(pte);
+    /*设置pte值来映射page_table条目*/
 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, pte);
 	vmf->orig_pte = pte;
 	if (page == swapcache) {
+        /*如果page与swapcache相同则，设置交换缓存页面用作anon匿名页面，则将该页面添加到anon反向映射中，并添加到activate_page链表当中*/
 		do_page_add_anon_rmap(page, vma, vmf->address, exclusive);
 		mem_cgroup_commit_charge(page, memcg, true, false);
 		activate_page(page);
 	} else { /* ksm created a completely new copy */
+        /*如果page不等于swapcache, 则将新页面添加到匿名反向映射中，并将页面添加到lru链表当中*/
 		page_add_new_anon_rmap(page, vma, vmf->address, false);
 		mem_cgroup_commit_charge(page, memcg, false, false);
 		lru_cache_add_active_or_unevictable(page, vma);
 	}
 
+    /*从交换缓存中删除条目*/
 	swap_free(entry);
+    /*如果交换高速缓存的容量超过50％，锁定的vma区域或锁住的页面，则它将尝试清空交换高速缓存*/
 	if (mem_cgroup_swap_full(page) ||
 	    (vma->vm_flags & VM_LOCKED) || PageMlocked(page))
 		try_to_free_swap(page);
@@ -3074,7 +3136,7 @@ int do_swap_page(struct vm_fault *vmf)
 		unlock_page(swapcache);
 		put_page(swapcache);
 	}
-
+	/*如果分配请求当中有写操作请求时，将分配一个新页面，并向COW调用do_wp_page（）函数并退出*/
 	if (vmf->flags & FAULT_FLAG_WRITE) {
 		ret |= do_wp_page(vmf);
 		if (ret & VM_FAULT_ERROR)
@@ -3083,6 +3145,7 @@ int do_swap_page(struct vm_fault *vmf)
 	}
 
 	/* No need to invalidate - it was non-present before */
+    /*刷新tlb缓存*/
 	update_mmu_cache(vma, vmf->address, vmf->pte);
 unlock:
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
