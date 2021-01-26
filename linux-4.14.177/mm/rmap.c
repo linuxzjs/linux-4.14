@@ -75,6 +75,7 @@
 static struct kmem_cache *anon_vma_cachep;
 static struct kmem_cache *anon_vma_chain_cachep;
 
+/*通过将分配的anon_vma结构的成员的程度设置为1，可以确定它在顶部，并使父节点和根节点指向自身*/
 static inline struct anon_vma *anon_vma_alloc(void)
 {
 	struct anon_vma *anon_vma;
@@ -94,6 +95,7 @@ static inline struct anon_vma *anon_vma_alloc(void)
 	return anon_vma;
 }
 
+/*释放anon_vma结构体*/
 static inline void anon_vma_free(struct anon_vma *anon_vma)
 {
 	VM_BUG_ON(atomic_read(&anon_vma->refcount));
@@ -138,10 +140,11 @@ static void anon_vma_chain_link(struct vm_area_struct *vma,
 				struct anon_vma_chain *avc,
 				struct anon_vma *anon_vma)
 {
+    /*avc指向vma与anon_vma*/
 	avc->vma = vma;
 	avc->anon_vma = anon_vma;
-	list_add(&avc->same_vma, &vma->anon_vma_chain);
-	anon_vma_interval_tree_insert(avc, &anon_vma->rb_root);
+	list_add(&avc->same_vma, &vma->anon_vma_chain);//将avc添加到vma的anon_vma_chain列表中
+	anon_vma_interval_tree_insert(avc, &anon_vma->rb_root);//将avc添加到anon_vma的RB树中
 }
 
 /**
@@ -179,11 +182,14 @@ int __anon_vma_prepare(struct vm_area_struct *vma)
 	struct anon_vma_chain *avc;
 
 	might_sleep();
-
+    /*分配创建一个anon_vma_chain也就是avc，并判断是否创建成功，如果失败goto out_enomem*/
 	avc = anon_vma_chain_alloc(GFP_KERNEL);
 	if (!avc)
 		goto out_enomem;
-
+    /*
+    如果相邻的vma可以可并，则合并公用一个anon_vma，如果不能合并则通过anon_vma = anon_vma_alloc()
+    重新分配一个anon_vma,
+    */
 	anon_vma = find_mergeable_anon_vma(vma);
 	allocated = NULL;
 	if (!anon_vma) {
@@ -198,6 +204,7 @@ int __anon_vma_prepare(struct vm_area_struct *vma)
 	spin_lock(&mm->page_table_lock);
 	if (likely(!vma->anon_vma)) {
 		vma->anon_vma = anon_vma;
+        /*通过rb红黑树，链表 将vma, avc， av关联起来*/
 		anon_vma_chain_link(vma, avc, anon_vma);
 		/* vma reference or self-parent link for new root */
 		anon_vma->degree++;
@@ -206,7 +213,7 @@ int __anon_vma_prepare(struct vm_area_struct *vma)
 	}
 	spin_unlock(&mm->page_table_lock);
 	anon_vma_unlock_write(anon_vma);
-
+    /*如果anon_vma和anon_vma_chain无法附加到vma，则分配的anon_vma和anon_vma_chain被释放*/
 	if (unlikely(allocated))
 		put_anon_vma(allocated);
 	if (unlikely(avc))
@@ -429,6 +436,10 @@ static void anon_vma_ctor(void *data)
 	anon_vma->rb_root = RB_ROOT_CACHED;
 }
 
+/*
+创建一个anon_vma slub缓存，slub缓存是为了分配anon_vma结构，并且在初始化时调用anon_vma_ctor（）函数完成该结构体的初始化操作
+并创建slub缓存以分配anon_vma_chain结构。
+*/
 void __init anon_vma_init(void)
 {
 	anon_vma_cachep = kmem_cache_create("anon_vma", sizeof(struct anon_vma),

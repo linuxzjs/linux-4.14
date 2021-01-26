@@ -1229,6 +1229,13 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
  * driver is doing some kind of reference counting. But that doesn't
  * really matter for the anon_vma sharing case.
  */
+/*
+满足一下四个条件可以合并：
+1. 两个区域分别连接到区域a和区域b。
+2. 两个区域的vma策略是相同的。
+3. 两个区域中，除了读，写，执行和软dirty以外的标志都被相同地使用。
+4. 两个区域的vm_files相同，并且vm_pgoff按区域a和b的顺序指定
+ */
 static int anon_vma_compatible(struct vm_area_struct *a, struct vm_area_struct *b)
 {
 	return a->vm_end == b->vm_start &&
@@ -1260,9 +1267,12 @@ static int anon_vma_compatible(struct vm_area_struct *a, struct vm_area_struct *
  * and with the same memory policies). That's all stable, even with just
  * a read lock on the mm_sem.
  */
+/*如果可以合并@a anon区域和@b anon区域的anon_vma，则会找到并返回@old区域的anon_vma*/
 static struct anon_vma *reusable_anon_vma(struct vm_area_struct *old, struct vm_area_struct *a, struct vm_area_struct *b)
 {
+    /*可以合并@a anon区域和@b anon区域*/
 	if (anon_vma_compatible(a, b)) {
+        /*@old区域中存在anon_vma，并且@old区域中仅注册了一个avc，则返回anon_vma*/
 		struct anon_vma *anon_vma = READ_ONCE(old->anon_vma);
 
 		if (anon_vma && list_is_singular(&old->anon_vma_chain))
@@ -1283,19 +1293,21 @@ struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *vma)
 {
 	struct anon_vma *anon_vma;
 	struct vm_area_struct *near;
-
+    /*获取下一个vma，并判断是否为空，如果为空则跳转到try_prev获取上一个vma*/
 	near = vma->vm_next;
 	if (!near)
 		goto try_prev;
-
+    /*如果当前vma与相邻的vma是否可以合并，如果可以合并则返回当前anon_vma*/
 	anon_vma = reusable_anon_vma(near, vma, near);
 	if (anon_vma)
 		return anon_vma;
+    
+    /*如何相邻的vma不能合并则查找当前vma上一个vma*/
 try_prev:
 	near = vma->vm_prev;
 	if (!near)
 		goto none;
-
+    /*如果当前vma与相邻的vma是否可以合并，如果可以合并则返回当前anon_vma，如果两次操作都失败了直接return NULL*/
 	anon_vma = reusable_anon_vma(near, near, vma);
 	if (anon_vma)
 		return anon_vma;
