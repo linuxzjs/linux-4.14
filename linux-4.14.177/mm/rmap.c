@@ -265,24 +265,39 @@ static inline void unlock_anon_vma_root(struct anon_vma *root)
  * good chance of avoiding scanning the whole hierarchy when it searches where
  * page is mapped.
  */
+/* dst为子进程的vma，src为父进程的vma */
 int anon_vma_clone(struct vm_area_struct *dst, struct vm_area_struct *src)
 {
 	struct anon_vma_chain *avc, *pavc;
 	struct anon_vma *root = NULL;
-
+    /* 遍历父进程的每个anon_vma_chain链表中的结点，保存在pavc中 */
 	list_for_each_entry_reverse(pavc, &src->anon_vma_chain, same_vma) {
 		struct anon_vma *anon_vma;
-
+        /* 分配一个新的avc结构 */
 		avc = anon_vma_chain_alloc(GFP_NOWAIT | __GFP_NOWARN);
 		if (unlikely(!avc)) {
+             /* 如果分配失败 */
 			unlock_anon_vma_root(root);
 			root = NULL;
+            /* 重新分配一次avc*/
 			avc = anon_vma_chain_alloc(GFP_KERNEL);
 			if (!avc)
 				goto enomem_failure;
 		}
+        /* 获取父结点的pavc指向的anon_vma */
 		anon_vma = pavc->anon_vma;
+        /* 对anon_vma的root上锁
+         * 如果root != anon_vma->root，则对root上锁，并返回anon_vma->root
+         * 第一次循环，root = NULL
+         */
 		root = lock_anon_vma_root(root, anon_vma);
+        /* 
+         * 设置新的avc->vma指向子进程的vma
+         * 设置新的avc->anon_vma指向父进程anon_vma_chain结点指向的anon_vma(这个anon_vma不一定属于父进程)
+         * 将新的avc->same_vma加入到子进程的anon_vma_chain链表头部
+         * 将新的avc->rb加入到父进程anon_vma_chain结点指向的anon_vma
+         * 简单的描述就是vma(子进程) <---------> avc <----------> av(父进程)
+         */
 		anon_vma_chain_link(dst, avc, anon_vma);
 
 		/*
@@ -299,7 +314,7 @@ int anon_vma_clone(struct vm_area_struct *dst, struct vm_area_struct *src)
 	}
 	if (dst->anon_vma)
 		dst->anon_vma->degree++;
-	unlock_anon_vma_root(root);
+	unlock_anon_vma_root(root);  /* 释放根的锁 */
 	return 0;
 
  enomem_failure:
@@ -319,35 +334,51 @@ int anon_vma_clone(struct vm_area_struct *dst, struct vm_area_struct *src)
  * the corresponding VMA in the parent process is attached to.
  * Returns 0 on success, non-zero on failure.
  */
+/*该函数必须明确一点：vma是子进程的虚拟空间， pvma是父进程虚拟地址空间;vma是目的dst目的地址空间，pvma是src源地址空间*/
 int anon_vma_fork(struct vm_area_struct *vma, struct vm_area_struct *pvma)
 {
 	struct anon_vma_chain *avc;
 	struct anon_vma *anon_vma;
 	int error;
-
+    
 	/* Don't bother if the parent process has no anon_vma here. */
+    /*判断父进程pvma是否指定anon_vma如果不存在，则直接return 0，如果存在则继续向下执行*/
 	if (!pvma->anon_vma)
 		return 0;
 
 	/* Drop inherited anon_vma, we'll reuse existing or allocate new. */
-	vma->anon_vma = NULL;
+	vma->anon_vma = NULL;//初始化vma设置为NULL
 
 	/*
 	 * First, attach the new VMA to the parent VMA's anon_vmas,
 	 * so rmap can find non-COWed pages in child processes.
 	 */
+	 /* 这里开始先检查父进程的此vma是否有anon_vma，有则继续，而上面进行了判断，只有父进程的此vma有anon_vma才会执行到这里
+     * 这里会遍历父进程的vma的anon_vma_chain链表，对每个结点新建一个anon_vma_chain，然后
+     * 设置新的avc->vma指向子进程的vma
+     * 设置新的avc->anon_vma指向父进程anon_vma_chain结点指向的anon_vma(这个anon_vma不一定属于父进程)
+     * 将新的avc->same_vma加入到子进程的anon_vma_chain链表中
+     * 将新的avc->rb加入到父进程anon_vma_chain结点指向的anon_vma
+     * 最终达到的结果就是通过新创建的avc链接上父进程av,同时链接子进程的vma;
+     * av(父进程) <----------> avc <---------> vma(子进程)
+     */
 	error = anon_vma_clone(vma, pvma);
 	if (error)
 		return error;
 
 	/* An existing anon_vma has been reused, all done then. */
+    /*如果子进程vma获取到的anon_vma已经被重用则直接return 0*/
 	if (vma->anon_vma)
 		return 0;
 
 	/* Then add our own anon_vma. */
+    /* 分配一个anon_vma结构用于子进程，将其refcount设为1，anon_vma->root指向本身
+     * 即使此vma是用于映射文件的，也会分配一个anon_vma
+     */
 	anon_vma = anon_vma_alloc();
 	if (!anon_vma)
 		goto out_error;
+     /*为子进程创建一个新的anon_vma_chain，也就是avc*/
 	avc = anon_vma_chain_alloc(GFP_KERNEL);
 	if (!avc)
 		goto out_error_free_anon_vma;
@@ -356,19 +387,31 @@ int anon_vma_fork(struct vm_area_struct *vma, struct vm_area_struct *pvma)
 	 * The root anon_vma's spinlock is the lock actually used when we
 	 * lock any of the anon_vmas in this anon_vma tree.
 	 */
+	/* 将新的anon_vma的root指向父进程的anon_vma的root */
 	anon_vma->root = pvma->anon_vma->root;
+    /* 将新的anon_vma的parent指向父进程的anon_vma*/
 	anon_vma->parent = pvma->anon_vma;
 	/*
 	 * With refcounts, an anon_vma can stay around longer than the
 	 * process it belongs to. The root anon_vma needs to be pinned until
 	 * this anon_vma is freed, because the lock lives in the root.
 	 */
+	/* 对父进程与子进程的anon_vma共同的root的refcount进行+1 */
 	get_anon_vma(anon_vma->root);
 	/* Mark this anon_vma as the one where our new (COWed) pages go. */
+    /* 将上面建立链接的anon_vma赋值到子进程vma的anon_vma上*/
 	vma->anon_vma = anon_vma;
+    /* 对这个新的anon_vma上锁 */
 	anon_vma_lock_write(anon_vma);
+    /* 新的avc的vma指向子进程的vma
+     * 新的avc的anon_vma指向子进程vma的anon_vma
+     * 新的avc的same_vma加入到子进程vma的anon_vma_chain链表的头部
+     * 新的avc的rb加入到子进程vma的anon_vma的红黑树中
+     * 也就是子进程的av(子进程) <----------> avc(子进程) <---------> vma(子进程)
+     */
 	anon_vma_chain_link(vma, avc, anon_vma);
 	anon_vma->parent->degree++;
+    /* 对这个anon_vma解锁 */
 	anon_vma_unlock_write(anon_vma);
 
 	return 0;
