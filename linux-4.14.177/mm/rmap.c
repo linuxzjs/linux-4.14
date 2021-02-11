@@ -1383,6 +1383,12 @@ void page_remove_rmap(struct page *page, bool compound)
 /*
  * @arg: enum ttu_flags will be passed to this argument
  */
+ /*
+  * 对vma进行unmap操作，并对此页的page->_mapcount--，这里面的页可能是文件页也可能是匿名页
+  * page: 目标page
+  * vma: 获取到的vma
+  * address: page在vma所属的进程地址空间中的线性地址
+  */
 static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 		     unsigned long address, void *arg)
 {
@@ -1396,16 +1402,17 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 	struct page *subpage;
 	bool ret = true;
 	unsigned long start = address, end;
-	enum ttu_flags flags = (enum ttu_flags)arg;
+	enum ttu_flags flags = (enum ttu_flags)arg;//获取arg的传入的属性
 
 	/* munlock has nothing to gain from examining un-locked vmas */
+    /* 对尚未被VM_LOCKED的vma发出了TTU_MUNLOCK请求，则返回成功以跳过该页面*/
 	if ((flags & TTU_MUNLOCK) && !(vma->vm_flags & VM_LOCKED))
 		return true;
-
+    /* 在请求做页面迁移时，如果该区域设备不是hmm，则返回true以跳过*/
 	if (IS_ENABLED(CONFIG_MIGRATION) && (flags & TTU_MIGRATION) &&
 	    is_zone_device_page(page) && !is_device_private_page(page))
 		return true;
-
+    /* 判断是否为huge 巨型帧页面拆分请求，如果时则进入split_huge_pmd_address，如果不是则继续向下执行*/
 	if (flags & TTU_SPLIT_HUGE_PMD) {
 		split_huge_pmd_address(vma, address,
 				flags & TTU_SPLIT_FREEZE, page);
@@ -1419,6 +1426,12 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 	 * Note that the page can not be free in this function as call of
 	 * try_to_unmap() must hold a reference on the page.
 	 */
+	/*
+	* start + (PAGE_SIZE << compound_order(page)) 是根据传入的address以及page计算出来的大小
+	* vma->vm_end理论上的最小值，
+	* 取这其中最小的那个作为end结束地址
+	* 同时判断page是否为巨型页面，如果是巨型页面则调用adjust_range_if_pmd_sharing_possible调整start,end的范围
+	*/
 	end = min(vma->vm_end, start + (PAGE_SIZE << compound_order(page)));
 	if (PageHuge(page)) {
 		/*
@@ -1427,9 +1440,11 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 		 */
 		adjust_range_if_pmd_sharing_possible(vma, &start, &end);
 	}
+    /* 调用已注册mmu通知程序的函数（* invalidate_range_start），以指示该函数在对辅助mmu范围执行tlb无效之前启动*/
 	mmu_notifier_invalidate_range_start(vma->vm_mm, start, end);
-
+    /*检查pvmw请求的正常映射状态是否正常，如果正常则进入判断*/
 	while (page_vma_mapped_walk(&pvmw)) {
+        /*该config没有配置所以该想选不会被执行*/
 #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
 		/* PMD-mapped THP migration entry */
 		if (!pvmw.pte && (flags & TTU_MIGRATION)) {
@@ -1448,31 +1463,38 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 		 * If it's recently referenced (perhaps page_referenced
 		 * skipped over this mm) then we should reactivate it.
 		 */
+		/* 如果flags没有要求忽略mlock的vma */
 		if (!(flags & TTU_IGNORE_MLOCK)) {
+             /* 如果此vma要求里面的页都锁在内存中，则进入判断语句当中                 */
 			if (vma->vm_flags & VM_LOCKED) {
 				/* PTE-mapped THP are never mlocked */
+                /* 判断该page是否为透明大页，如果是则进入判断循环*/
 				if (!PageTransCompound(page)) {
 					/*
 					 * Holding pte lock, we do *not* need
 					 * mmap_sem here
 					 */
+					/* 将阻止Linux内存回收进程回收这个地址空间的页面 */
 					mlock_vma_page(page);
 				}
+                /* 如果是透明大页则回收该页面，在ARM64架构当中该函数为空NULL*/
 				ret = false;
 				page_vma_mapped_walk_done(&pvmw);
 				break;
 			}
-			if (flags & TTU_MUNLOCK)
+			if (flags & TTU_MUNLOCK)//如果没有被锁则continue
 				continue;
 		}
 
 		/* Unexpected PMD-mapped THP? */
 		VM_BUG_ON_PAGE(!pvmw.pte, page);
-
+        /* 此处不理解，page 与 pfn(页帧号) 本身不是一个概念为什么要做加减，目的是为什么？ */
 		subpage = page - page_to_pfn(page) + pte_pfn(*pvmw.pte);
 		address = pvmw.address;
-
+        /* 判断是否为巨型页，如果是则进入判断当中 */
 		if (PageHuge(page)) {
+            /* 判断是否为共享大页，如果是则进入判断将清除范围区域的缓存和tlb缓存，
+             * 并对辅助MMU的范围执行tlb无效。然后停止循环并停止该过程*/
 			if (huge_pmd_unshare(mm, &address, pvmw.pte)) {
 				/*
 				 * huge_pmd_unshare unmapped an entire PMD
@@ -1498,7 +1520,9 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 				break;
 			}
 		}
-
+        /* 判断迁移功能是否开启，且flags是否设置TTU_MIGRATION迁移类型，在此版本的arm64架构当中is_zone_device_page(page)为false = 0
+         * 所以此时无法进入该判断当中，跳过该步骤。
+         */
 		if (IS_ENABLED(CONFIG_MIGRATION) &&
 		    (flags & TTU_MIGRATION) &&
 		    is_zone_device_page(page)) {
@@ -1519,8 +1543,9 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 			set_pte_at(mm, pvmw.address, pvmw.pte, swp_pte);
 			goto discard;
 		}
-
+        /* 忽略页表项中的Accessed */
 		if (!(flags & TTU_IGNORE_ACCESS)) {
+            /* 清除页表项的Accessed标志 */
 			if (ptep_clear_flush_young_notify(vma, address,
 						pvmw.pte)) {
 				ret = false;
@@ -1530,7 +1555,12 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 		}
 
 		/* Nuke the page table entry. */
+        /*
+        刷新用户虚拟地址的缓存，在ARM64体系结构不执行任何操作。
+        如果架构的缓存类型是vivt或vipt别名，则将其刷新
+        */
 		flush_cache_page(vma, address, pte_pfn(*pvmw.pte));
+        /* 清除映射到用户虚拟地址的pte条目，取消映射，然后刷新tlb。如果收到了TTU_BATCH_FLUSH插入请求，则会收集并处理tlb刷新，以提高性能 */
 		if (should_defer_flush(mm, flags)) {
 			/*
 			 * We clear the PTE but do not flush so potentially
@@ -1544,26 +1574,36 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 
 			set_tlb_ubc_flush_pending(mm, pte_dirty(pteval));
 		} else {
+              /* 获取页表项内容，保存到pteval中，然后清空页表项 */
 			pteval = ptep_clear_flush(vma, address, pvmw.pte);
 		}
 
 		/* Move the dirty bit to the page. Now the pte is gone. */
+        /* 如果页表项标记了此页为脏页 */
 		if (pte_dirty(pteval))
-			set_page_dirty(page);
+			set_page_dirty(page); /* 设置页描述符的PG_dirty标记 */
 
 		/* Update high watermark before we lower rss */
+         /* 更新进程所拥有的最大页框数 */
 		update_hiwater_rss(mm);
-
+         /* 此页是被标记为"坏页"的页，这种页用于内核纠正一些错误，是否用于边界检查? */
 		if (PageHWPoison(page) && !(flags & TTU_IGNORE_HWPOISON)) {
 			pteval = swp_entry_to_pte(make_hwpoison_entry(subpage));
+            /* 判断是否为大页 */
 			if (PageHuge(page)) {
+                /* 获取复合页order, 1 << order相当于知道这个复合页包含多少个page */
 				int nr = 1 << compound_order(page);
 				hugetlb_count_sub(nr, mm);
 				set_huge_swap_pte_at(mm, address,
 						     pvmw.pte, pteval,
 						     vma_mmu_pagesize(vma));
 			} else {
+                /* mm_counter(page)函数判断是匿名页还是文件页，如果是PageAnon(page)匿名页则相当于：dec_mm_counter(mm, MM_ANONPAGES);mm的MM_ANONPAGES--
+                 * 如果是文件页mm_counter(page) = MM_FILEPAGES 则相当于dec_mm_counter(mm, MM_FILEPAGES);mm的MM_FILEPAGES--
+                 * 如果是共享页mm_counter(page) = MM_SHMEMPAGES 则相当于dec_mm_counter(mm, MM_SHMEMPAGES);mm的MM_SHMEMPAGES--
+                 */
 				dec_mm_counter(mm, mm_counter(page));
+                 /* 将交换条目值映射到pte条目 */
 				set_pte_at(mm, address, pvmw.pte, pteval);
 			}
 
@@ -1578,9 +1618,15 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 			 * migration) will not expect userfaults on already
 			 * copied pages.
 			 */
+		    /*
+		    * 在userfaultfd vma的pte值未使用的情况下，相关的mm计数器（anon，file，shm）将减少页数，该函数过程如上
+            */
 			dec_mm_counter(mm, mm_counter(page));
 		} else if (IS_ENABLED(CONFIG_MIGRATION) &&
 				(flags & (TTU_MIGRATION|TTU_SPLIT_FREEZE))) {
+			/*
+			 * 如果配置了迁移模块，且flags设置迁移，拆分属性 TTU_MIGRATION|TTU_SPLIT_FREEZE，则进入改判断语句当中
+             */
 			swp_entry_t entry;
 			pte_t swp_pte;
 			/*
@@ -1588,19 +1634,25 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 			 * pte. do_swap_page() will wait until the migration
 			 * pte is removed and then restart fault handling.
 			 */
+			/* 为subpage创建一个页迁移使用的swp_entry_t，此swp_entry_t指向此subpage */
 			entry = make_migration_entry(subpage,
 					pte_write(pteval));
+            /* 将entry转为swp_pte页表项 */
 			swp_pte = swp_entry_to_pte(entry);
+            /* 页表项有一位用于_PAGE_SOFT_DIRTY，用于kmemcheck */
 			if (pte_soft_dirty(pteval))
 				swp_pte = pte_swp_mksoft_dirty(swp_pte);
+            /* 将配置好的新的页表项swp_pte写入页表项中 */
 			set_pte_at(mm, address, pvmw.pte, swp_pte);
-		} else if (PageAnon(page)) {
+		} else if (PageAnon(page)) {/* 如果page是匿名页 */
+            /* 获取page->private中保存的内容，调用到try_to_unmap()前会把此页加入到swapcache，然后分配一个以swap页槽偏移量为内容的swp_entry_t */
 			swp_entry_t entry = { .val = page_private(subpage) };
 			pte_t swp_pte;
 			/*
 			 * Store the swap location in the pte.
 			 * See handle_pte_fault() ...
 			 */
+			/* 如果该页面以较低的概率与swapbacked和swapcache标志设置不匹配，它将执行辅助mmu的tlb无效，并使例程中止 */
 			if (unlikely(PageSwapBacked(page) != PageSwapCache(page))) {
 				WARN_ON_ONCE(1);
 				ret = false;
@@ -1610,6 +1662,10 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 			}
 
 			/* MADV_FREE page check */
+            /*
+             * 如果它不是SwapBacked页面，它将再次映射该页面并导致例程停止。但是，如果它不是脏页，它将执行辅助mmu的tlb无效，
+             * 减少anon mm计数器，然后移至废弃标签以进行以下操作
+             */
 			if (!PageSwapBacked(page)) {
 				if (!PageDirty(page)) {
 					dec_mm_counter(mm, MM_ANONPAGES);
@@ -1626,30 +1682,42 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 				page_vma_mapped_walk_done(&pvmw);
 				break;
 			}
-
+            /* 对于内存回收，基本都是这种情况，因为page在调用到这里之前已经被移动到了swapcache 
+             * 而对于内存碎片整理，
+             * 检查entry是否有效，并且增加entry对应页槽在swap_info_struct的swap_map的数值，此数值标记此页槽的页有多少个进程引用
+             */
 			if (swap_duplicate(entry) < 0) {
+                /* 检查失败，把原来的页表项内容写回去 */
 				set_pte_at(mm, address, pvmw.pte, pteval);
 				ret = false;
 				page_vma_mapped_walk_done(&pvmw);
 				break;
 			}
+             /* entry有效，并且swap_map中目标页槽的数值也++了 */
+            /* 这个if的情况是此vma所属进程的mm没有加入到所有进程的mmlist中(init_mm.mmlist) */
 			if (list_empty(&mm->mmlist)) {
 				spin_lock(&mmlist_lock);
 				if (list_empty(&mm->mmlist))
 					list_add(&mm->mmlist, &init_mm.mmlist);
 				spin_unlock(&mmlist_lock);
 			}
+             /* 减少此mm的匿名页统计 */
 			dec_mm_counter(mm, MM_ANONPAGES);
+             /* 增加此mm的页表中标记了页在swap的页表项的数量 */
 			inc_mm_counter(mm, MM_SWAPENTS);
+             /* 将entry转为一个页表项 */
 			swp_pte = swp_entry_to_pte(entry);
+            /* 页表项有一位用于_PAGE_SOFT_DIRTY，用于kmemcheck */
 			if (pte_soft_dirty(pteval))
 				swp_pte = pte_swp_mksoft_dirty(swp_pte);
+            /* 将配置好的新的页表项swp_pte写入页表项中 */
 			set_pte_at(mm, address, pvmw.pte, swp_pte);
 		} else
-			dec_mm_counter(mm, mm_counter_file(page));
+			dec_mm_counter(mm, mm_counter_file(page));/* 此页是文件页，仅对此mm的文件页计数--，文件页不需要设置页表项，只需要对页表项进行清空 */
 discard:
+        /* 主要对此页的页描述符的_mapcount进行--操作，当_mapcount为-1时，表示此页已经没有页表项映射了 */
 		page_remove_rmap(subpage, PageHuge(page));
-		put_page(page);
+		put_page(page);//释放该page
 		mmu_notifier_invalidate_range(mm, address,
 					      address + PAGE_SIZE);
 	}
@@ -1695,10 +1763,16 @@ static int page_mapcount_is_zero(struct page *page)
  */
 bool try_to_unmap(struct page *page, enum ttu_flags flags)
 {
+      /* 反向映射控制结构 */
 	struct rmap_walk_control rwc = {
+	     /* 对一个vma所属页表进行unmap操作
+         * 每次获取一个vma就会对此vma调用一次此函数，在函数里第一件事就是判断获取的vma有没有映射此page
+         */
 		.rmap_one = try_to_unmap_one,
 		.arg = (void *)flags,
+		/* 对一个vma进行unmap后会执行此函数 */
 		.done = page_mapcount_is_zero,
+		/* 用于对整个anon_vma的红黑树进行上锁，用读写信号量，锁是aon_vma的rwsem */
 		.anon_lock = page_lock_anon_vma_read,
 	};
 
@@ -1710,10 +1784,18 @@ bool try_to_unmap(struct page *page, enum ttu_flags flags)
 	 * locking requirements of exec(), migration skips
 	 * temporary VMAs until after exec() completes.
 	 */
+	/*
+	* thp（TTU_SPLIT_FREEZE）的拆分或迁移（TTU_MIGRATION）。
+	* 对于除ksm之外的匿名映射页面，在（* invalid_vma）挂钩函数中指定了invalid_migration_vma（）函数
+	*/
 	if ((flags & (TTU_MIGRATION|TTU_SPLIT_FREEZE))
 	    && !PageKsm(page) && PageAnon(page))
 		rwc.invalid_vma = invalid_migration_vma;
 
+    /*
+    * 判断flags是否设置TTU_RMAP_LOCKED,如果设置则获取锁，、
+    * 如果没有设置锁则调用rmap_walk， 对所有映射了此页的vma进行遍历，并取消  映射关系
+    */
 	if (flags & TTU_RMAP_LOCKED)
 		rmap_walk_locked(page, &rwc);
 	else
