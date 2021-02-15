@@ -1912,7 +1912,7 @@ static int move_freepages(struct zone *zone,
 	struct page *page;
 	unsigned int order;
 	int pages_moved = 0;
-
+    /* 在ARM64架构且该版本内核当中CONFIG_HOLES_IN_ZONE=y,此处跳过 */
 #ifndef CONFIG_HOLES_IN_ZONE
 	/*
 	 * page_zone is not safe to call in this context when
@@ -1923,11 +1923,12 @@ static int move_freepages(struct zone *zone,
 	 */
 	VM_BUG_ON(page_zone(start_page) != page_zone(end_page));
 #endif
-
+    /*  */
 	if (num_movable)
 		*num_movable = 0;
 
 	for (page = start_page; page <= end_page;) {
+        /* 起始页到结束页，如果该页是孔洞区域则continue跳过 */
 		if (!pfn_valid_within(page_to_pfn(page))) {
 			page++;
 			continue;
@@ -1935,7 +1936,7 @@ static int move_freepages(struct zone *zone,
 
 		/* Make sure we are not inadvertently changing nodes */
 		VM_BUG_ON_PAGE(page_to_nid(page) != zone_to_nid(zone), page);
-
+        /* 如果未通过在伙伴系统中进行释放来管理页面，则通过continue将其跳过 */
 		if (!PageBuddy(page)) {
 			/*
 			 * We assume that pages that could be isolated for
@@ -1949,14 +1950,15 @@ static int move_freepages(struct zone *zone,
 			page++;
 			continue;
 		}
-
-		order = page_order(page);
+        /* 移至与当前order相对应的free_list的指定migratetype */
+		order = page_order(page);//获取当前page的order
+		/* 将该page移动到该order对应的free_list的migratetype类型当中     */
 		list_move(&page->lru,
 			  &zone->free_area[order].free_list[migratetype]);
-		page += 1 << order;
-		pages_moved += 1 << order;
+		page += 1 << order;//当前page加上移动的page页面个数，作为下一次的页面偏移使用
+		pages_moved += 1 << order;//统计该函数移动的页面个数。
 	}
-
+    //返回移动的页面个数
 	return pages_moved;
 }
 
@@ -1966,18 +1968,22 @@ int move_freepages_block(struct zone *zone, struct page *page,
 	unsigned long start_pfn, end_pfn;
 	struct page *start_page, *end_page;
 
-	start_pfn = page_to_pfn(page);
-	start_pfn = start_pfn & ~(pageblock_nr_pages-1);
-	start_page = pfn_to_page(start_pfn);
-	end_page = start_page + pageblock_nr_pages - 1;
-	end_pfn = start_pfn + pageblock_nr_pages - 1;
+	start_pfn = page_to_pfn(page);//将page转换成pfn页表项
+	start_pfn = start_pfn & ~(pageblock_nr_pages-1);//页表项对齐
+	start_page = pfn_to_page(start_pfn);//将对齐后的页表项转换成起始page
+	end_page = start_page + pageblock_nr_pages - 1;//起始page加上2^10次方 也就是1024个page
+	end_pfn = start_pfn + pageblock_nr_pages - 1;//起始页表项加上1024个page的页表项，作为结束地址的页表项
 
 	/* Do not cross zone boundaries */
+    /* 判断start_pfn >= zone->zone_start_pfn且start_pfn   <= zone->zone_start_pfn(起始页面的pfn页表项) + zone->spanned_pages(空闲页面，包含空洞部分)是否在这个范围 
+     * 如果在则保持start_page不变，如果不在则start_page = page;
+     * 同理如果end_pfn在这个范围则end_page不变，如果不在则return 0
+     */
 	if (!zone_spans_pfn(zone, start_pfn))
 		start_page = page;
 	if (!zone_spans_pfn(zone, end_pfn))
 		return 0;
-
+    /* 将所有空闲页面的迁移类型从请求区域的开始页面移动到结束页面，并返回已移动页面的数量 */
 	return move_freepages(zone, start_page, end_page, migratetype,
 								num_movable);
 }
