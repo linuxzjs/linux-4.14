@@ -1787,27 +1787,34 @@ static bool check_new_pages(struct page *page, unsigned int order)
 inline void post_alloc_hook(struct page *page, unsigned int order,
 				gfp_t gfp_flags)
 {
-	set_page_private(page, 0);
-	set_page_refcounted(page);
+	set_page_private(page, 0);//将页面描述符的私有成员初始化为0
+	set_page_refcounted(page);//将参考计数器初始化为1
 
-	arch_alloc_page(page, order);
-	kernel_map_pages(page, 1 << order, 1);
-	kasan_alloc_pages(page, order);
-	kernel_poison_pages(page, 1 << order, 1);
-	set_page_owner(page, order, gfp_flags);
+	arch_alloc_page(page, order);//ARM和ARM64没有相应的调用函数
+	kernel_map_pages(page, 1 << order, 1);//调用页面分配进行debug调试
+	kasan_alloc_pages(page, order);//KASAN调试
+	kernel_poison_pages(page, 1 << order, 1);//检查分配的内存中是否预先标记了任何kasan
+	set_page_owner(page, order, gfp_flags);//设置page的ower拥有者，便于后续的调试跟踪。
 }
 
 static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
 							unsigned int alloc_flags)
 {
 	int i;
-
+    /* 初始化page的相关描述，设置相关属性 */
 	post_alloc_hook(page, order, gfp_flags);
-
+    
+    /* 在没有开启CONFIG_PAGE_POISONING_ZERO，且设置gfp_flags了__GFP_ZERO
+     * 相当于收到了page的零初始化请求，所有分配的内存都初始化为0，所以就有了clear_highpage，将分配的页面全部初始化为0
+     * 32位系统highmem区域中的内存被临时映射，初始化为0，然后再次取消映射，但是在ARM64当中没有highmem区域，此处应该时一个空函数，什么都没做
+     */
 	if (!free_pages_prezeroed() && (gfp_flags & __GFP_ZERO))
 		for (i = 0; i < (1 << order); i++)
 			clear_highpage(page + i);
-
+    /*
+     * 判断order != 0，且gfp_flags设置了复合页属性__GFP_COMP
+     * 页面描述符将初始化为复合页，并完成初始化，将所有尾页均指向首页，这里存在一个关键的变量就是mapping一个链表
+     */
 	if (order && (gfp_flags & __GFP_COMP))
 		prep_compound_page(page, order);
 
@@ -1817,6 +1824,10 @@ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags
 	 * steps that will free more memory. The caller should avoid the page
 	 * being used for !PFMEMALLOC purposes.
 	 */
+	/*
+	* 如果无水印发出分配请求时，将-1分配给页描述符的索引成员，以指示该分配是在pfmemalloc状态下接收到的 
+	* 如果有水印请求时，设置page->index = 0;
+    */
 	if (alloc_flags & ALLOC_NO_WATERMARKS)
 		set_page_pfmemalloc(page);
 	else
@@ -3235,6 +3246,8 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
 		}
         /*对比内存的min,low,high对比判断内存是否足够，如果足够直接
         跳转到try_this_zone当中进行buddy system内存分配
+        zone_watermark_fast快速的分配内存，这里的fast(快)就体现在order = 0，直接判断成功
+        不需要做任何的页面回收操作
         */
 		mark = zone->watermark[alloc_flags & ALLOC_WMARK_MASK];
 		if (!zone_watermark_fast(zone, order, mark,
@@ -3252,7 +3265,7 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
 			    !zone_allows_reclaim(ac->preferred_zoneref->zone, zone))
 				continue;
             
-            /*return 返回值为NODE_RECLAIM_NOSCAN，NODE_RECLAIM_FULL代表内存回收失败直接continue跳过
+            /*进行node页面回收操作，return 返回值为NODE_RECLAIM_NOSCAN，NODE_RECLAIM_FULL代表内存回收失败直接continue跳过
             zone区域，如果回收成功则进入zone_watermark_ok判断内存是否够用
             */
 			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order);
@@ -3279,6 +3292,7 @@ try_this_zone:
 		page = rmqueue(ac->preferred_zoneref->zone, zone, order,
 				gfp_mask, alloc_flags, ac->migratetype);
 		if (page) {
+            /* 对新分配的page进行初始化操作，设置flags，clean page等 */
 			prep_new_page(page, order, gfp_mask, alloc_flags);
 
 			/*
@@ -3368,7 +3382,7 @@ __alloc_pages_cpuset_fallback(gfp_t gfp_mask, unsigned int order,
 			      const struct alloc_context *ac)
 {
 	struct page *page;
-
+    /* 将cpuset应用于alloc标志后，请尝试首先分配页面，如果分配失败，它将尝试再次分配，但不包括cpuset */
 	page = get_page_from_freelist(gfp_mask, order,
 			alloc_flags|ALLOC_CPUSET, ac);
 	/*
@@ -3401,6 +3415,7 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	 * Acquire the oom lock.  If that fails, somebody else is
 	 * making progress for us.
 	 */
+	/* 获取oom lock失败，设置did_some_progress = 1，schedule_timeout_uninterruptible,以后如果没有被休眠调度则直接return NULL */
 	if (!mutex_trylock(&oom_lock)) {
 		*did_some_progress = 1;
 		schedule_timeout_uninterruptible(1);
@@ -3414,16 +3429,19 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	 * attempt shall not depend on __GFP_DIRECT_RECLAIM && !__GFP_NORETRY
 	 * allocation which will never fail due to oom_lock already held.
 	 */
+	/* 添加hardwall和cpuset属性，并尝试根据高水位线（不包括直接回收）再次分配页面 */
 	page = get_page_from_freelist((gfp_mask | __GFP_HARDWALL) &
 				      ~__GFP_DIRECT_RECLAIM, order,
 				      ALLOC_WMARK_HIGH|ALLOC_CPUSET, ac);
-	if (page)
+	if (page)//页面分配成功直接跳转到out处，分配失败则继续向下执行
 		goto out;
 
 	/* Coredumps can quickly deplete all memory reserves */
+    /* 如果当前任务已经是核心转储，它将移至out */
 	if (current->flags & PF_DUMPCORE)
 		goto out;
 	/* The OOM killer will not help higher order allocs */
+    /* 如果内存分配请求order超出PAGE_ALLOC_COSTLY_ORDER，则OOM killer无法克服该请求，因此将其移至out */
 	if (order > PAGE_ALLOC_COSTLY_ORDER)
 		goto out;
 	/*
@@ -3432,11 +3450,16 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	 * because it is very likely that the caller has a more reasonable
 	 * fallback than shooting a random task.
 	 */
+	/* 在__GFP_RETRY_MAYFAIL请求的情况下，许多回收机会已经用尽，并且存在合理回退的可能性，因此要跳过OOM杀死，请移至out
+	 * 通过migration_pages（）-> new_page（）请求分配时，使用__GFP_RETRY_MAYFILE
+	 */
 	if (gfp_mask & __GFP_RETRY_MAYFAIL)
 		goto out;
 	/* The OOM killer does not needlessly kill tasks for lowmem */
+    /*如果内存分配申请发生在DMA32下面的区域请求分配，则分配到out：标签以跳过OOM终止 */
 	if (ac->high_zoneidx < ZONE_NORMAL)
 		goto out;
+    /* 如果无法使用io和fs，请转到out，跳过 oom killer */
 	if (pm_suspended_storage())
 		goto out;
 	/*
@@ -3450,10 +3473,12 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	 */
 
 	/* The OOM killer may not free memory on a specific node */
+    /* 如果请求仅从本地节点进行分配，则该请求将移至out */
 	if (gfp_mask & __GFP_THISNODE)
 		goto out;
 
 	/* Exhausted what can be done so it's blamo time */
+    /* 使用out_of_memory 执行OOM killer 操作来调用该页面或者如果使用了nofail选项，did_some_progress = 1*/
 	if (out_of_memory(&oc) || WARN_ON_ONCE(gfp_mask & __GFP_NOFAIL)) {
 		*did_some_progress = 1;
 
@@ -3461,12 +3486,13 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 		 * Help non-failing allocations by giving them access to memory
 		 * reserves
 		 */
+		/* 如果使用nofail选项，它将尝试通过cpuset后备进行分配 */
 		if (gfp_mask & __GFP_NOFAIL)
 			page = __alloc_pages_cpuset_fallback(gfp_mask, order,
 					ALLOC_NO_WATERMARKS, ac);
 	}
 out:
-	mutex_unlock(&oom_lock);
+	mutex_unlock(&oom_lock);//释放oom锁定并返回
 	return page;
 }
 
@@ -3536,10 +3562,10 @@ should_compact_retry(struct alloc_context *ac, int order, int alloc_flags,
 	bool ret = false;
 	int retries = *compaction_retries;
 	enum compact_priority priority = *compact_priority;
-
+    /* 如果order = 0  则不需要进行任何压缩尝试直接return false */
 	if (!order)
 		return false;
-
+    /* 如果在最后一次压缩过程中迁移的页面,如果压缩页面成功compact_result = COMPACT_SUCCESS，则compaction_retries计数器加一 */
 	if (compaction_made_progress(compact_result))
 		(*compaction_retries)++;
 
@@ -3548,6 +3574,7 @@ should_compact_retry(struct alloc_context *ac, int order, int alloc_flags,
 	 * so it doesn't really make much sense to retry except when the
 	 * failure could be caused by insufficient priority
 	 */
+	/* 如果最后一次扫描完成，但是没有结果时直接跳转到check_priority */
 	if (compaction_failed(compact_result))
 		goto check_priority;
 
@@ -3557,6 +3584,7 @@ should_compact_retry(struct alloc_context *ac, int order, int alloc_flags,
 	 * But do not retry if the given zonelist is not suitable for
 	 * compaction.
 	 */
+	/* 在这种情况下，由于若干原因最后压缩过程未完成。如果再次尝试压缩，则返回是否适当。 */
 	if (compaction_withdrawn(compact_result)) {
 		ret = compaction_zonelist_suitable(ac, order, alloc_flags);
 		goto out;
@@ -3570,8 +3598,10 @@ should_compact_retry(struct alloc_context *ac, int order, int alloc_flags,
 	 * would need much more detailed feedback from compaction to
 	 * make a better decision.
 	 */
+	/* 如果order大于PAGE_ALLOC_COSTLY_ORDER，则最大重试次数除以4，最大重试次数变成4次 */
 	if (order > PAGE_ALLOC_COSTLY_ORDER)
 		max_retries /= 4;
+    /* 如果重试的次数小于等于最大重试次数max_retries则直接跳转到out完成全部操作 */
 	if (*compaction_retries <= max_retries) {
 		ret = true;
 		goto out;
@@ -3581,6 +3611,10 @@ should_compact_retry(struct alloc_context *ac, int order, int alloc_flags,
 	 * Make sure there are attempts at the highest priority if we exhausted
 	 * all retries or failed at the lower priorities.
 	 */
+	 /*
+      * 如果紧凑优先级高，我们想给更多机会重试。因此如果压缩优先级超过最小优先级，则压缩优先级降低1，重试次数重置为0，并返回true。
+      *
+      */
 check_priority:
 	min_priority = (order > PAGE_ALLOC_COSTLY_ORDER) ?
 			MIN_COMPACT_COSTLY_PRIORITY : MIN_COMPACT_PRIORITY;
@@ -3739,7 +3773,10 @@ static void wake_all_kswapds(unsigned int order, const struct alloc_context *ac)
 	struct zoneref *z;
 	struct zone *zone;
 	pg_data_t *last_pgdat = NULL;
-
+    /*
+     * 在high_zoneidx下方的区域列表中，它遍历high_zoneidx下方的区域，
+     * 这些区域是在节点掩码中设置的节点，并唤醒相应节点的所有kswapd。
+     */
 	for_each_zone_zonelist_nodemask(zone, z, ac->zonelist,
 					ac->high_zoneidx, ac->nodemask) {
 		if (last_pgdat != zone->zone_pgdat)
@@ -3851,6 +3888,10 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 	 * their order will become available due to high fragmentation so
 	 * always increment the no progress counter for them
 	 */
+	/*
+     * 如果在此函数调用之前执行的直接回收中有页数，并且内存申请请求order高于PAGE_ALLOC_COSTLY_ORDER高阶order，则将输出参数no_progress_loops增大1，以节省直接回收的重试次数。
+     * 如果在现有的直接回收处理过程中没有检索到页面，或者内存申请order低于高阶order，则重试计数器设置为0。
+     */
 	if (did_some_progress && order <= PAGE_ALLOC_COSTLY_ORDER)
 		*no_progress_loops = 0;
 	else
@@ -3860,6 +3901,7 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 	 * Make sure we converge to OOM if we cannot make any progress
 	 * several times in the row.
 	 */
+	/* 如果该值超过了最大回收尝试次数，则是在OOM之前的情况，因此将检索原子请求保留用于高阶处理的所有高原子类型的空闲页面，并将其转换为请求的页面类型 */
 	if (*no_progress_loops > MAX_RECLAIM_RETRIES) {
 		/* Before OOM, exhaust highatomic_reserve */
 		return unreserve_highatomic_pageblock(ac, true);
@@ -3871,13 +3913,16 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 	 * request even if all reclaimable pages are considered then we are
 	 * screwed and have to go OOM.
 	 */
+	/* 遍历high_zoneidx下针对区域列表中节点掩码的区域 */
 	for_each_zone_zonelist_nodemask(zone, z, ac->zonelist, ac->high_zoneidx,
 					ac->nodemask) {
 		unsigned long available;
 		unsigned long reclaimable;
 		unsigned long min_wmark = min_wmark_pages(zone);
 		bool wmark;
-
+        /*
+         * 区域可用页面数 = 区域可回收页面数reclaimable + 区域最大可用页面数NR_FREE_PAGES 
+         */
 		available = reclaimable = zone_reclaimable_pages(zone);
 		available += zone_page_state_snapshot(zone, NR_FREE_PAGES);
 
@@ -3885,6 +3930,7 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 		 * Would the allocation succeed if we reclaimed all
 		 * reclaimable pages?
 		 */
+		/* 如果可用页面数超出最小水印标准，进入判断当中 */
 		wmark = __zone_watermark_ok(zone, order, min_wmark,
 				ac_classzone_idx(ac), alloc_flags, available);
 		trace_reclaim_retry_zone(z, order, reclaimable,
@@ -3896,6 +3942,9 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 			 * an IO to complete to slow down the reclaim and
 			 * prevent from pre mature OOM
 			 */
+			/* 
+             * 如果did_some_progress = 0，则说明先前尝试的回收页数为0，并且有50％以上的可回收页处于写入延迟状态，则即使立即重试，回收页的可能性也很低。
+             */
 			if (!did_some_progress) {
 				unsigned long write_pending;
 
@@ -3917,6 +3966,12 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 			 * do a short sleep here rather than calling
 			 * cond_resched().
 			 */
+			/*
+			 * 通过查询current当前进程flags确认是否需要休眠，
+			 * 如果current属性是PF_WQ_WORKER，工作队列属性则执行schedule_timeout_uninterruptible(1);timeout超时后发生调度
+			 * 如果current当前属性不是工作队列，则直接内核抢占cond_resched
+			 * 完成以上操作return true。
+             */
 			if (current->flags & PF_WQ_WORKER)
 				schedule_timeout_uninterruptible(1);
 			else
@@ -3966,7 +4021,15 @@ static inline struct page *
 __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 						struct alloc_context *ac)
 {
+    /* 
+     * 在分配页面时，判断gfp_mask是否设置了直接回收内存的标志，如果是，说明内存分配过程需要直接回收；
+     * 则确认can_direct_reclaim = true 允许进行直接回收操作
+     * 一般此类操作会在一下几种情况发生：
+     * GFP_KERNEL，GFP_KERNEL_ACCOUNT，GFP_NOIO，GFP_NOFS用于内核内存分配
+     * GFP_USER用于分配用户内存 
+     */
 	bool can_direct_reclaim = gfp_mask & __GFP_DIRECT_RECLAIM;
+    /* 判断order是否大于PAGE_ALLOC_COSTLY_ORDER，也就是order > 3是否成立，如果成立则costly_order = TRUE，被称作为高阶 */
 	const bool costly_order = order > PAGE_ALLOC_COSTLY_ORDER;
 	struct page *page = NULL;
 	unsigned int alloc_flags;
@@ -3981,6 +4044,10 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	/*
 	 * We also sanity check to catch abuse of atomic reserves being used by
 	 * callers that are not in atomic context.
+	 */
+	/* 
+	 * 判断如果gfp_mask掩码，同时设置了__GFP_ATOMIC|__GFP_DIRECT_RECLAIM原子请求和直接回收请求，
+	 * 则重新设置gfp_mask将__GFP_ATOMIC原子请求删除
 	 */
 	if (WARN_ON_ONCE((gfp_mask & (__GFP_ATOMIC|__GFP_DIRECT_RECLAIM)) ==
 				(__GFP_ATOMIC|__GFP_DIRECT_RECLAIM)))
@@ -4015,8 +4082,9 @@ retry_cpuset:
 	if (!ac->preferred_zoneref->zone)
 		goto nopage;
 
-    /*如果为真此时唤醒kswapds进程，这个过程是异步的并不是直接获取，而是通过内存的交换释放出一定的内存出来
-    */
+    /*
+     * 如果为真此时唤醒kswapds进程，这个过程是异步的并不是直接获取，而是通过内存的交换释放出一定的内存出来
+     */
 	if (gfp_mask & __GFP_KSWAPD_RECLAIM)
 		wake_all_kswapds(order, ac);
 
@@ -4040,11 +4108,12 @@ retry_cpuset:
 	 * Don't try this for allocations that are allowed to ignore
 	 * watermarks, as the ALLOC_NO_WATERMARKS attempt didn't yet happen.
 	 */
-	 /*满足一下三点可以直接使用压缩内存，获得足够的page
-	 1.can_direct_reclaim允许直接回收内存;2.order合法且migratetype不能是可以移动内存MIGRATE_MOVABLE类型
-	 3.不能使用gfp_pfmemalloc_allowed通用分配方式。满足以上三个条件则直接使用__alloc_pages_direct_compact
-	 通过内存压缩分配获取page，如果获取内存失败则继续向下执行
-	 */
+	 /* 满足一下三点可以直接使用压缩内存，获得足够的page
+	  * 1.can_direct_reclaim允许直接回收内存;
+	  * 2.order合法且migratetype不能是可以移动内存MIGRATE_MOVABLE类型、再或者order > 3，此时costly_order为真
+	  * 3.不能使用gfp_pfmemalloc_allowed通用分配方式。满足以上三个条件则直接使用__alloc_pages_direct_compact
+	  * 通过直接内存压缩分配获取page，如果获取内存失败则继续向下执行
+	  */
 	if (can_direct_reclaim &&
 			(costly_order ||
 			   (order > 0 && ac->migratetype != MIGRATE_MOVABLE))
@@ -4060,8 +4129,9 @@ retry_cpuset:
 		 * Checks for costly allocations with __GFP_NORETRY, which
 		 * includes THP page fault allocations
 		 */
-		/*上面分配内存失败，gfp_mask 校验分配内存失败后不再重试
-        */
+		/*
+		 * 内存直接回收失败，如果gfp_mask掩码设置__GFP_NORETRY，同时用于高阶order内存分配时，判断当中。
+         */
 		if (costly_order && (gfp_mask & __GFP_NORETRY)) {
 			/*
 			 * If compaction is deferred for high-order allocations,
@@ -4083,7 +4153,7 @@ retry_cpuset:
 			 * using async compaction.
 			 */
 			/*在我们看来内存回收/压缩是值得尝试的，但是同步的压缩内存的方式回收
-            会给系统带来很大的压力，所以我们还是只用异步的方式压缩回收内存*/
+            会给系统带来很大的压力，所以我们还是只用异步的方式压缩回收内存，异步压缩将用于重试*/
 			compact_priority = INIT_COMPACT_PRIORITY;
 		}
 	}
@@ -4115,17 +4185,17 @@ retry:
 		goto got_pg;
 
 	/* Caller is not willing to reclaim, we can't balance anything */
-    /*如果不能直接分配则进入Nopage,如果允许直接分配内存则继续向下执行*/
+    /* 上文页面分配失败，如果此时can_direct_reclaim = false 不允许直接回收内存，则跳转到NOPAGE，如果设置可以直接回收内存则继续向下执行。*/
 	if (!can_direct_reclaim)
 		goto nopage;
 
 	/* Avoid recursion of direct reclaim */
-    /*避免直接回收造成的递归操作，如果是则进入nopage，如果不是则继续向下执行，直接分配内存*/
+    /* 避免直接回收造成的递归操作，如果是则进入nopage，如果不是则继续向下执行，直接分配内存*/
 	if (current->flags & PF_MEMALLOC)
 		goto nopage;
 
 	/* Try direct reclaim and then allocating */
-    /*直接分配内存，并分配page页面，如果失败跳转到nopage*/
+    /*直接回内存，并分配page页面，如果失败跳转到nopage*/
 	page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
 							&did_some_progress);
 	if (page)
@@ -4147,9 +4217,10 @@ retry:
 	 * Do not retry costly high order allocations unless they are
 	 * __GFP_RETRY_MAYFAIL
 	 */
+	/* 高阶order内存分配失败，同时gfp_mask掩码没有设置__GFP_RETRY_MAYFAIL重试属性则直接跳转到nopage */
 	if (costly_order && !(gfp_mask & __GFP_RETRY_MAYFAIL))
 		goto nopage;
-    /*判断需要retry重新分配内存*/
+    /*判断是否需要retry重新分配内存*/
 	if (should_reclaim_retry(gfp_mask, order, ac, alloc_flags,
 				 did_some_progress > 0, &no_progress_loops))
 		goto retry;
@@ -4172,7 +4243,7 @@ retry:
 		goto retry_cpuset;
 
 	/* Reclaim has failed us, start killing things */
-    /*启动oom killer杀死某些进程，直接分配内存*/
+    /*启动oom killer杀死某些特定进程，并直接分配内存*/
 	page = __alloc_pages_may_oom(gfp_mask, order, ac, &did_some_progress);
 	if (page)
 		goto got_pg;
@@ -4249,11 +4320,13 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 		struct alloc_context *ac, gfp_t *alloc_mask,
 		unsigned int *alloc_flags)
 {
-	ac->high_zoneidx = gfp_zone(gfp_mask);
-	ac->zonelist = node_zonelist(preferred_nid, gfp_mask);
-	ac->nodemask = nodemask;
-	ac->migratetype = gfpflags_to_migratetype(gfp_mask);
-
+	ac->high_zoneidx = gfp_zone(gfp_mask);//gfp_mask对应的区域索引
+	ac->zonelist = node_zonelist(preferred_nid, gfp_mask);//获取内存所在的node节点
+	ac->nodemask = nodemask;//将nodemask赋值给ac结构体
+	ac->migratetype = gfpflags_to_migratetype(gfp_mask);//根据gfp_mask获取page的迁移类型
+    /* cpuset是否初始化，如果初始化则增加__GFP_HARDWALL到alloc_mask
+     * 判断nodemask属性，如果为空则增加cpuset_current_mems_allowed，如果不为空则ALLOC_CPUSET增加到alloc_flags
+     */
 	if (cpusets_enabled()) {
 		*alloc_mask |= __GFP_HARDWALL;
 		if (!ac->nodemask)
@@ -4261,15 +4334,15 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
 		else
 			*alloc_flags |= ALLOC_CPUSET;
 	}
-
+    /* 在该版本的内核当中arm64位架构下这两个函数为NULL */
 	fs_reclaim_acquire(gfp_mask);
 	fs_reclaim_release(gfp_mask);
 
 	might_sleep_if(gfp_mask & __GFP_DIRECT_RECLAIM);
-
+    /* 调试内核时使用这个参数时从uboot传递下来的，一般情况下时没有用的 */
 	if (should_fail_alloc_page(gfp_mask, order))
 		return false;
-
+    /* 判断CONFIG_CMA是否启动，同时判断该page的迁移类型是否时可移动类型，如果满足以上两个条件则alloc_flags设置  ALLOC_CMA*/
 	if (IS_ENABLED(CONFIG_CMA) && ac->migratetype == MIGRATE_MOVABLE)
 		*alloc_flags |= ALLOC_CMA;
 
@@ -4281,6 +4354,7 @@ static inline void finalise_ac(gfp_t gfp_mask,
 		unsigned int order, struct alloc_context *ac)
 {
 	/* Dirty zone balancing only done in the fast path */
+    /* 脏的zone 脏区平衡，这种方式只适用与fast           path 快速分配路径*/
 	ac->spread_dirty_pages = (gfp_mask & __GFP_WRITE);
 
 	/*
@@ -4288,6 +4362,11 @@ static inline void finalise_ac(gfp_t gfp_mask,
 	 * also used as the starting point for the zonelist iterator. It
 	 * may get reset for allocations that ignore memory policies.
 	 */
+	/*
+	 * 当前区域列表中的第一个可用区域存储在preferred_zoneref中。此值将在以后的统计信息中使用。
+	 * 如果没有第一个区域，则无法进行页面分配，因此它将移至out标签并退出该功能。
+	 * 如果未指定ac.nodemask且其值为NULL，则指定为cpuset的节点掩码将用于当前任务
+     */
 	ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
 					ac->high_zoneidx, ac->nodemask);
 }
@@ -4316,6 +4395,7 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
     /*
     将gfp_mask进行解析填充到alloc_context ac结构体当中，为下面的
     地址分配做准备，相当于初始化了ac结构体，同时根据node mask确认 node zone
+    主要的目的其实就是设置这种flags属性
     */
 	gfp_mask &= gfp_allowed_mask;
 	alloc_mask = gfp_mask;
