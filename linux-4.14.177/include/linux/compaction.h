@@ -20,12 +20,12 @@ enum compact_priority {
 /* When adding new states, please adjust include/trace/events/compaction.h */
 enum compact_result {
 	/* For more detailed tracepoint output - internal to compaction */
-	COMPACT_NOT_SUITABLE_ZONE,
+	COMPACT_NOT_SUITABLE_ZONE,//trace用于调试输出或内部使用
 	/*
 	 * compaction didn't start as it was not possible or direct reclaim
 	 * was more suitable
 	 */
-	COMPACT_SKIPPED,
+	COMPACT_SKIPPED,//跳过压缩，因为无法执行压缩或直接回收更合适
 	/* compaction didn't start as it was deferred due to past failures */
 	COMPACT_DEFERRED,
 
@@ -41,7 +41,7 @@ enum compact_result {
 	 * The full zone was compacted scanned but wasn't successfull to compact
 	 * suitable pages.
 	 */
-	COMPACT_COMPLETE,
+	COMPACT_COMPLETE,//已完成所有区域的压缩，但是尚未确保可以通过压缩分配的页面
 	/*
 	 * direct compaction has scanned part of the zone but wasn't successfull
 	 * to compact suitable pages.
@@ -55,7 +55,7 @@ enum compact_result {
 	 * direct compaction terminated after concluding that the allocation
 	 * should now succeed
 	 */
-	COMPACT_SUCCESS,
+	COMPACT_SUCCESS,//在确保可分配页面安全后，直接压缩结束
 };
 
 struct alloc_context; /* in mm/internal.h */

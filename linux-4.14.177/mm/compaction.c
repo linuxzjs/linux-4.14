@@ -140,12 +140,21 @@ EXPORT_SYMBOL(__ClearPageMovable);
  */
 void defer_compaction(struct zone *zone, int order)
 {
+    /* 提高内存碎片整理计数器的阀值，zone的内存碎片整理计数器阀值 ，也就是只有同步整理会增加推迟计数器的阀值
+     * 重置zone->compact_considered = 0，zone->compact_defer_shift++;
+     */
 	zone->compact_considered = 0;
 	zone->compact_defer_shift++;
-
+    /*
+     * 如果order < zone->compact_order_failed，那么zone->compact_order_failed = order
+     */
 	if (order < zone->compact_order_failed)
 		zone->compact_order_failed = order;
-
+    /*
+     * 如果zone->compact_defer_shift   >  COMPACT_MAX_DEFER_SHIFT，推迟扫面延迟的阈值大于COMPACT_MAX_DEFER_SHIFT也就是6
+     * 则设置zone->compact_defer_shift = COMPACT_MAX_DEFER_SHIFT;
+     * 如果zone->compact_defer_shift < COMPACT_MAX_DEFER_SHIFT就相当于zone->compact_defer_shift++;该阈值增加 1 
+     */
 	if (zone->compact_defer_shift > COMPACT_MAX_DEFER_SHIFT)
 		zone->compact_defer_shift = COMPACT_MAX_DEFER_SHIFT;
 
@@ -155,12 +164,23 @@ void defer_compaction(struct zone *zone, int order)
 /* Returns true if compaction should be skipped this time */
 bool compaction_deferred(struct zone *zone, int order)
 {
+    /* zone可压缩的阈值defer_limit = 2^compact_defer_shift       */
 	unsigned long defer_limit = 1UL << zone->compact_defer_shift;
-
+    /* 如果order < compact_order_failed 说明该zone是可以被整理压缩的，所以return false此时该zone必须要做内存碎片整理，不应该被skip跳过  */
 	if (order < zone->compact_order_failed)
 		return false;
+/*
+ * zone->compact_considered是否小于1UL << zone->compact_defer_shift
+       * 小于则推迟，并且zone->compact_considered++，也就是这个函数会主动去推迟此管理区的内存碎片整理
+       * 本次请求的order值小于之前失败时的order值，那这次整理必须要进行
+       * zone->compact_considered和zone->compact_defer_shift会只有在内存碎片整理完成后，从此zone获取到了连续的1 << order个页框的情况下会重置为0。
+       */
 
 	/* Avoid possible overflow */
+    /* 如果zone->compact_considered自加后 > derfer_limit则zone->compact_considered = defer_limit;此时直接return false同样说明zone存在足够的空闲
+     * page可用于碎片整理,碎片整理的次数已经超过阈值defer_limit，不能再推迟了，所以就必须接受碎片整理
+     * 如果compact_considered < defer_limit说明推迟的次数依然小于阈值的给你的defer_limit，则说明该zone依然是可以推迟的，所以return true skip zone
+     */
 	if (++zone->compact_considered > defer_limit)
 		zone->compact_considered = defer_limit;
 
@@ -180,10 +200,15 @@ bool compaction_deferred(struct zone *zone, int order)
 void compaction_defer_reset(struct zone *zone, int order,
 		bool alloc_success)
 {
+    /* 在compact_zone_order内存压缩整理成功的前提下也就是status == COMPACT_SUCCESS
+     * 如果设置alloc_success = true完成内存内存分配工作，此时重置compact_considered、compact_defer_shift = 0
+     * 如果设置alloc_success = false 内存分配失败则不会做该重置操作
+     */
 	if (alloc_success) {
 		zone->compact_considered = 0;
 		zone->compact_defer_shift = 0;
 	}
+    /* 如果order  >= compact_order_failedz则更新重置该参数，将order + 1 赋给该变量，相当该zone压缩失败的最大值变成了order*2的倍数 */
 	if (order >= zone->compact_order_failed)
 		zone->compact_order_failed = order + 1;
 
@@ -193,9 +218,13 @@ void compaction_defer_reset(struct zone *zone, int order,
 /* Returns true if restarting compaction after many failures */
 bool compaction_restarting(struct zone *zone, int order)
 {
+    /* 如果order < zone->compact_order_failed 推迟扫描失败的最大order，则return false  */
 	if (order < zone->compact_order_failed)
 		return false;
-
+    /*
+     * 如果同时满足zone->compact_defer_shift == COMPACT_MAX_DEFER_SHIFT， zone->compact_considered >= 1UL << zone->compact_defer_shift;
+     * 则return true
+     */
 	return zone->compact_defer_shift == COMPACT_MAX_DEFER_SHIFT &&
 		zone->compact_considered >= 1UL << zone->compact_defer_shift;
 }
@@ -1513,8 +1542,15 @@ bool compaction_zonelist_suitable(struct alloc_context *ac, int order,
 static enum compact_result compact_zone(struct zone *zone, struct compact_control *cc)
 {
 	enum compact_result ret;
+     /* 管理区开始页框号 */
 	unsigned long start_pfn = zone->zone_start_pfn;
+     /* 管理区结束页框号 */
 	unsigned long end_pfn = zone_end_pfn(zone);
+     /* 
+     * 同步还是异步 
+     * 同步为true 1 ，异步为false 0
+     * 轻同步和同步都是同步
+     */ 
 	const bool sync = cc->mode != MIGRATE_ASYNC;
 
 	/*
@@ -1525,17 +1561,24 @@ static enum compact_result compact_zone(struct zone *zone, struct compact_contro
 	cc->total_free_scanned = 0;
 	cc->nr_migratepages = 0;
 	cc->nr_freepages = 0;
+    /* 
+     * 初始化freepages空闲页面列表
+     * 初始化migratepages可移动页面列表
+     */
 	INIT_LIST_HEAD(&cc->freepages);
 	INIT_LIST_HEAD(&cc->migratepages);
-
+    /* 获取可进行移动的页框类型(__GFP_RECLAIMABLE、__GFP_MOVABLE) */
 	cc->migratetype = gfpflags_to_migratetype(cc->gfp_mask);
+    /* 根据传入的cc->order判断此次整理是否能够进行，主要是因为整理需要部分内存，这里面会判断内存是否足够 */
 	ret = compaction_suitable(zone, cc->order, cc->alloc_flags,
 							cc->classzone_idx);
 	/* Compaction is likely to fail */
+    /* zone碎片足够compact_sucess,或者是内存数量不足以进行内存碎片整理skip */
 	if (ret == COMPACT_SUCCESS || ret == COMPACT_SKIPPED)
 		return ret;
 
 	/* huh, compaction_suitable is returning something unexpected */
+    /* 可以进行内存碎片整理 */
 	VM_BUG_ON(ret != COMPACT_CONTINUE);
 
 	/*
@@ -1690,6 +1733,7 @@ static enum compact_result compact_zone_order(struct zone *zone, int order,
 		unsigned int alloc_flags, int classzone_idx)
 {
 	enum compact_result ret;
+    /* 对compact_control结构体进行初始化操作 */
 	struct compact_control cc = {
 		.order = order,
 		.gfp_mask = gfp_mask,
@@ -1703,7 +1747,7 @@ static enum compact_result compact_zone_order(struct zone *zone, int order,
 		.ignore_skip_hint = (prio == MIN_COMPACT_PRIORITY),
 		.ignore_block_suitable = (prio == MIN_COMPACT_PRIORITY)
 	};
-
+    /* 内存碎片整理 */
 	ret = compact_zone(zone, &cc);
 
 	VM_BUG_ON(!list_empty(&cc.freepages));
@@ -1728,6 +1772,7 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
 		unsigned int alloc_flags, const struct alloc_context *ac,
 		enum compact_priority prio)
 {
+    /* 表示可以使用磁盘的IO操作 */
 	int may_perform_io = gfp_mask & __GFP_IO;
 	struct zoneref *z;
 	struct zone *zone;
@@ -1737,26 +1782,37 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
 	 * Check if the GFP flags allow compaction - GFP_NOIO is really
 	 * tricky context because the migration might require IO
 	 */
+	 /* 如果不能使用磁盘IO，则跳过本次整理，因为不使用IO有可能导致死锁 */
 	if (!may_perform_io)
 		return COMPACT_SKIPPED;
 
 	trace_mm_compaction_try_to_compact_pages(order, gfp_mask, prio);
 
 	/* Compact each zone in the list */
+    /* 遍历zonelist当中的每一个zone 是否能够整理足够的空间供内存分配使用 */
 	for_each_zone_zonelist_nodemask(zone, z, ac->zonelist, ac->high_zoneidx,
 								ac->nodemask) {
 		enum compact_result status;
-
+        /* 
+         * 如果prio优先级大于MIN_COMPACT_PRIORITY，且order > zone->compact_order_failed时是不需要continue跳过的该zone
+         * zone->compact_considered是否小于1UL << zone->compact_defer_shift
+         * 小于则推迟，并且zone->compact_considered++，也就是这个函数会主动去推迟此管理区的内存碎片整理
+         * 本次请求的order值小于之前失败时的order值，那这次整理必须要进行
+         * zone->compact_considered和zone->compact_defer_shift会只有在内存碎片整理完成后，从此zone获取到了连续的1 << order个页框的情况下会重置为0
+         */
 		if (prio > MIN_COMPACT_PRIORITY
 					&& compaction_deferred(zone, order)) {
 			rc = max_t(enum compact_result, COMPACT_DEFERRED, rc);
 			continue;
 		}
-
+        /* 对遍历到的zone进行内存碎片整理 */
 		status = compact_zone_order(zone, order, gfp_mask, prio,
 					alloc_flags, ac_classzone_idx(ac));
 		rc = max(status, rc);
-
+        /* 如果内存整理成功则进入compaction_defer_reset函数当中，完成
+         * zone->compact_considered = 0;
+		 * zone->compact_defer_shift = 0;重置操作
+		 */
 		/* The allocation should succeed, stop compacting */
 		if (status == COMPACT_SUCCESS) {
 			/*
@@ -1765,11 +1821,18 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
 			 * will repeat this with true if allocation indeed
 			 * succeeds in this zone.
 			 */
+			/*
+			 * 内存整理成功但是alloc_success = false 内存分配失败则更新zone的延迟的相关变量
+			 * 此处是应为zone满足了内存整理的需求，但是并不明确内存是否能够分配成功所以就设置了alloc_success = false
+             */
 			compaction_defer_reset(zone, order, false);
 
 			break;
 		}
-
+        /* 
+         * 如果prio优先级不是异步整理操作，同时status 状态为COMPACT_COMPLETE、COMPACT_PARTIAL_SKIPPED
+         * 代表compact_zone_order扫描完成或者是skip跳过该zone则进入判断当中执行defer_compaction更新zone推迟相关变量
+         */
 		if (prio != COMPACT_PRIO_ASYNC && (status == COMPACT_COMPLETE ||
 					status == COMPACT_PARTIAL_SKIPPED))
 			/*
@@ -1777,6 +1840,11 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
 			 * so we defer compaction there. If it ends up
 			 * succeeding after all, it will be reset.
 			 */
+			/* 提高内存碎片整理计数器的阀值，zone的内存碎片整理计数器阀值 ，也就是只有同步整理会增加推迟计数器的阀值
+             * 重置zone->compact_considered = 0
+             * 如果zone->compact_defer_shift < COMPACT_MAX_DEFER_SHIFT，那么zone->compact_defer_shift++
+             * 如果order < zone->compact_order_failed，那么zone->compact_order_failed = order
+             */
 			defer_compaction(zone, order);
 
 		/*
