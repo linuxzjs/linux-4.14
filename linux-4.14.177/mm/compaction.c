@@ -438,6 +438,9 @@ static inline bool compact_should_abort(struct compact_control *cc)
  * returning 0 on any invalid PFNs or non-free pages inside of the pageblock
  * (even though it may still end up isolating some pages).
  */
+/* 扫描从start_pfn到end_pfn的空闲页框，一般都是一个pageblock的开始页框ID和结束页框ID，并把它们放入到freelist中，
+ * 返回此pageblock中总共获得的空闲页框数量
+ */
 static unsigned long isolate_freepages_block(struct compact_control *cc,
 				unsigned long *start_pfn,
 				unsigned long end_pfn,
@@ -454,8 +457,10 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
 	cursor = pfn_to_page(blockpfn);
 
 	/* Isolate free pages. */
+    /* 从pageblock的start向end进行扫描 */
 	for (; blockpfn < end_pfn; blockpfn++, cursor++) {
 		int isolated;
+        /* 当前页框 */
 		struct page *page = cursor;
 
 		/*
@@ -469,9 +474,11 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
 			break;
 
 		nr_scanned++;
+         /* 检查此页框号是否正确 */
 		if (!pfn_valid_within(blockpfn))
 			goto isolate_fail;
-
+        
+        /* valid_page是开始扫描的页框 */
 		if (!valid_page)
 			valid_page = page;
 
@@ -480,6 +487,11 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
 		 * potentially a lot of iterations if we skip them at once.
 		 * The check is racy, but we can consider only valid values
 		 * and the only danger is skipping too much.
+		 */
+		/* 如果page是复合页透明大页，巨型页则进入判断
+		 * 获取复合页的order值，如果comp_order < MAX_ORDER则blockpfn += (1UL << comp_order)更新blockpfn起始地址
+		 * cursor += (1UL << comp_order) - 1;更新cursor，后跳转到isolate_fail
+		 * 如果order >= MAX_ORDER则直接goto isolate_fail
 		 */
 		if (PageCompound(page)) {
 			unsigned int comp_order = compound_order(page);
@@ -491,7 +503,7 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
 
 			goto isolate_fail;
 		}
-
+        /* 检查此页是否在伙伴系统中，不在说明是正在使用的页框，则跳过 */
 		if (!PageBuddy(page))
 			goto isolate_fail;
 
@@ -502,6 +514,7 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
 		 * so it is correct to skip the suitable migration target
 		 * recheck as well.
 		 */
+		 /* 获取锁 */
 		if (!locked) {
 			/*
 			 * The zone lock must be held to isolate freepages.
@@ -522,21 +535,31 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
 		}
 
 		/* Found a free page, will break it into order-0 pages */
+        /* 根据page获取该page所属的order */
 		order = page_order(page);
+        /* 将page开始的连续空闲页框拆分为连续的单个页框，返回数量，order值会在page的页描述符中，并设置pageblock的类型为MIGRATE_MOVABLE */
 		isolated = __isolate_free_page(page, order);
 		if (!isolated)
 			break;
+        /* 重置page的order,此处推测order应该变成了0，变成了一个个单独的page */
 		set_page_private(page, order);
-
+        /* 更新总共隔离的空闲页框数量 */
 		total_isolated += isolated;
+         /* 更新nr_freepages总共隔离的空闲页框数量 */
 		cc->nr_freepages += isolated;
+        /* 将分离后的连续page全部添加到freelist链表当中 */
 		list_add_tail(&page->lru, freelist);
-
+        /* 如果strict = false，且migratepages可移动页面 <= freepages自由移动页面
+         * 则blockpfn += isolated;，同时break完成pageblock中page的隔离操作
+         * 如果nr_freepages > nr_migratepages则说明有足够的自由空闲页面可以提供给可移动页面转移相关内容则直接break，
+         * 如果不满足条件则还需需要continue继续执行
+         */
 		if (!strict && cc->nr_migratepages <= cc->nr_freepages) {
 			blockpfn += isolated;
 			break;
 		}
 		/* Advance to the end of split page */
+         /* 跳过这段连续空闲页框，因为上面把这段空闲页框全部加入到了freelist中 */
 		blockpfn += isolated - 1;
 		cursor += isolated - 1;
 		continue;
@@ -548,7 +571,7 @@ isolate_fail:
 			continue;
 
 	}
-
+     /* 如果占有锁则释放掉 */
 	if (locked)
 		spin_unlock_irqrestore(&cc->zone->lock, flags);
 
@@ -574,12 +597,15 @@ isolate_fail:
 		total_isolated = 0;
 
 	/* Update the pageblock-skip if the whole pageblock was scanned */
+    /* 扫描完了此pageblock，如果此pageblock中没有隔离出空闲页框，则标记此pageblock为跳过 */
 	if (blockpfn == end_pfn)
 		update_pageblock_skip(cc, valid_page, total_isolated, false);
 
 	cc->total_free_scanned += nr_scanned;
 	if (total_isolated)
 		count_compact_events(COMPACTISOLATED, total_isolated);
+    
+     /* 返回总共获得的空闲页框 */
 	return total_isolated;
 }
 
@@ -1140,10 +1166,12 @@ static void isolate_freepages(struct compact_control *cc)
 	 * The low boundary is the end of the pageblock the migration scanner
 	 * is using.
 	 */
+	/* 获取开始扫描页框所在的pageblock，并且设置为此pageblock的最后一个页框或者管理区最后一个页框 */
 	isolate_start_pfn = cc->free_pfn;
 	block_start_pfn = pageblock_start_pfn(cc->free_pfn);
 	block_end_pfn = min(block_start_pfn + pageblock_nr_pages,
 						zone_end_pfn(zone));
+    /* 按pageblock_nr_pages对齐，low_pfn保存的是可迁移页框扫描所在的页框号，但是这里有可能migrate_pfn == free_pfn */
 	low_pfn = pageblock_end_pfn(cc->migrate_pfn);
 
 	/*
@@ -1151,6 +1179,20 @@ static void isolate_freepages(struct compact_control *cc)
 	 * pages on cc->migratepages. We stop searching if the migrate
 	 * and free page scanners meet or enough free pages are isolated.
 	 */
+    /* 先决条件如下：这个过程与isolate_migratepages()函数的过程是刚好相反的，migratepage是从前向后，freeapges是从后向前
+     * 开始扫描空闲页框，从管理区最后一个pageblock向migrate_pfn所在的pageblock扫描
+     * block_start_pfn是pageblock开始页框号
+     * block_end_pfn是pageblock结束页框号
+     */
+    /* 循环条件：方向是从后先前，所以这里block_start_pfn -= pageblock_nr_pages,
+     * 扫描到low_pfn所在pageblokc或者其后一个pageblock，low_pfn是low_pfn保存的是可迁移页框扫描所在的页框号，并按照pageblock_nr_pages对齐。
+     * 当 block_start_pfn >= low_pfn时说明migratepage扫描类型pageblock地址小于freepages类型pageblock说明migratepage与freepage还未相遇
+     * 如果block_start_pfn   <  low_pfn则说明migratepage的pageblock 地址已经超过了freepage的pageblock地址，则整个扫描过程结束
+     * block_end_pfn = block_start_pfn当前pageblock的起始地址变成了上一个pageblock的结束地址
+     * block_start_pfn -= pageblock_nr_pages,此时block_start_pfn变成上一个pageblock的起始地址，
+     * 后将block_start_pfn上一个pageblock的起始地址赋给isolate_start_pfn开始扫描
+     * migratepage— —— —— —— > < ———— ———— ———— freepages从后向前
+     */
 	for (; block_start_pfn >= low_pfn;
 				block_end_pfn = block_start_pfn,
 				block_start_pfn -= pageblock_nr_pages,
@@ -1160,24 +1202,35 @@ static void isolate_freepages(struct compact_control *cc)
 		 * suitable migration targets, so periodically check if we need
 		 * to schedule, or even abort async compaction.
 		 */
+		/* 由于需要扫描很多页框，所以这里做个检查，执行时间过长则睡眠，一般是32个1024 pageblock页框休眠一下，break扫描
+		 * 异步的情况还需要判断运行进程是否需要被调度 */
 		if (!(block_start_pfn % (SWAP_CLUSTER_MAX * pageblock_nr_pages))
 						&& compact_should_abort(cc))
 			break;
 
+         /* 检查block_start_pfn和block_end_pfn，如果没问题，返回block_start_pfn所指的页描述符，也就是pageblock第一页描述符 */
 		page = pageblock_pfn_to_page(block_start_pfn, block_end_pfn,
 									zone);
 		if (!page)
 			continue;
 
 		/* Check the block is suitable for migration */
+        /* 如果处于伙伴系统中，它所代表的这段连续页框的order值必须小于pageblock的order值
+         * 如果不是MIGRATE_MOVABLE或MIGRATE_CMA类型则return false 则continue跳过这段页框块
+         * 如果是MIGRATE_MOVABLE或MIGRATE_CMA类型则return true则说明pageblock时存在migrate type的则继续向下执行
+         */
 		if (!suitable_migration_target(cc, page))
 			continue;
 
 		/* If isolation recently failed, do not retry */
+         /* 检查cc中是否标记了即使pageblock标记了跳过也对pageblock进行扫描，并且检查此pageblock是否被标记为跳过 */
 		if (!isolation_suitable(cc, page))
 			continue;
 
 		/* Found a block suitable for isolating free pages from. */
+        /* 扫描从isolate_start_pfn到block_end_pfn的空闲页框，并把它们放入到freelist中，返回此pageblock中总共获得的空闲页框数量 
+         * 第一轮扫描可能会跳过，应该第一次isolate_start_pfn是等于zone最后一个页框的
+         */
 		isolate_freepages_block(cc, &isolate_start_pfn, block_end_pfn,
 					freelist, false);
 
@@ -1185,8 +1238,14 @@ static void isolate_freepages(struct compact_control *cc)
 		 * If we isolated enough freepages, or aborted due to lock
 		 * contention, terminate.
 		 */
+		/* 如果cc->nr_freepages >= cc->nr_migratepages且contended说明freepage与migratepage还未相遇，则进入判断当中进一步分析确认 */
 		if ((cc->nr_freepages >= cc->nr_migratepages)
 							|| cc->contended) {
+			/* 如果isolate_start_pfn >= block_end_pfn 说明freepages   扫描的pageblock还为与migratepage扫描的pageblock相遇
+			 * isolate_start_pfn = block_start_pfn - pageblock_nr_pages; 此时isolate_start_pfn就是向前一个pageblock的起始freepage扫描地址
+			 * 也就是下一个freepage扫描的pageblock的起始页框
+			 * 负责如果isolate_start_pfn < block_end_pfn则说名migratepage已经超过了freepage，则break 结束扫描
+			 */
 			if (isolate_start_pfn >= block_end_pfn) {
 				/*
 				 * Restart at previous pageblock if more
@@ -1206,6 +1265,7 @@ static void isolate_freepages(struct compact_control *cc)
 	}
 
 	/* __isolate_free_page() does not map the pages */
+     /* 设置页表项，设置为内核使用 */
 	map_pages(freelist);
 
 	/*
@@ -1232,18 +1292,21 @@ static struct page *compaction_alloc(struct page *migratepage,
 	 * Isolate free pages if necessary, and if we are not aborting due to
 	 * contention.
 	 */
+	/* 如果cc中的空闲页框链表为空 */
 	if (list_empty(&cc->freepages)) {
+         /* 并且cc->contended没有记录错误代码 */
 		if (!cc->contended)
-			isolate_freepages(cc);
+			isolate_freepages(cc);/* 从cc->free_pfn开始向前获取空闲页 */
 
 		if (list_empty(&cc->freepages))
 			return NULL;
 	}
-
+     /* 从cc->freepages链表中拿出一个空闲page */
 	freepage = list_entry(cc->freepages.next, struct page, lru);
+    /* 将该page从lru当中删除 */
 	list_del(&freepage->lru);
 	cc->nr_freepages--;
-
+    /* 返回空闲页框 */
 	return freepage;
 }
 

@@ -1140,6 +1140,7 @@ out:
  * Obtain the lock on page, remove all ptes and migrate the page
  * to the newly allocated page in newpage.
  */
+/* 从get_new_page中获取一个新页，然后将page取消映射，并把page的数据复制到新页上 */
 static ICE_noinline int unmap_and_move(new_page_t get_new_page,
 				   free_page_t put_new_page,
 				   unsigned long private, struct page *page,
@@ -1149,11 +1150,11 @@ static ICE_noinline int unmap_and_move(new_page_t get_new_page,
 	int rc = MIGRATEPAGE_SUCCESS;
 	int *result = NULL;
 	struct page *newpage;
-
+    /* 获取一个空闲页，具体见compaction_alloc() */
 	newpage = get_new_page(page, private, &result);
 	if (!newpage)
 		return -ENOMEM;
-
+     /* 如果页的page_count == 1，说明此页必定是非文件页而且没有进程映射了此页，此页可以直接释放掉 */
 	if (page_count(page) == 1) {
 		/* page was freed from under us. So we are done. */
 		ClearPageActive(page);
@@ -1170,7 +1171,7 @@ static ICE_noinline int unmap_and_move(new_page_t get_new_page,
 			put_page(newpage);
 		goto out;
 	}
-
+    /* 此页是透明大页则跳过 */
 	if (unlikely(PageTransHuge(page) && !PageTransHuge(newpage))) {
 		lock_page(page);
 		rc = split_huge_page(page);
@@ -1178,13 +1179,14 @@ static ICE_noinline int unmap_and_move(new_page_t get_new_page,
 		if (rc)
 			goto out;
 	}
-
+     /* 将page取消映射，并把page的数据复制到newpage中 */
 	rc = __unmap_and_move(page, newpage, force, mode);
 	if (rc == MIGRATEPAGE_SUCCESS)
 		set_page_owner_migrate_reason(newpage, reason);
 
 out:
 	if (rc != -EAGAIN) {
+        /* 迁移成功，将旧的page放回到LRU链表中，为什么放入lru链表，因为旧的page已经是一个空闲的page了 */
 		/*
 		 * A page that has been migrated has all references
 		 * removed and will be freed. A page that has not been
@@ -1397,6 +1399,14 @@ out:
  *
  * Returns the number of pages that were not migrated, or an error code.
  */
+/* 将from中的可移动页移到新页上，新页会在get_new_page中获取，也就是将migratepage转移到freepages当中，完成页面的整理
+ * from = &cc->migratepages
+ * get_new_page = compaction_alloc
+ * put_new_page = compaction_free
+ * private = (unsigned long)cc
+ * mode = cc->mode
+ * reson = MR_COMPACTION
+ */
 int migrate_pages(struct list_head *from, new_page_t get_new_page,
 		free_page_t put_new_page, unsigned long private,
 		enum migrate_mode mode, int reason)
@@ -1407,16 +1417,18 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
 	int pass = 0;
 	struct page *page;
 	struct page *page2;
+     /* 获取当前进程是否允许将页写到swap */
 	int swapwrite = current->flags & PF_SWAPWRITE;
 	int rc;
-
+    /* 如果当前进程不支持将页写到swap，要强制其支持 */
 	if (!swapwrite)
 		current->flags |= PF_SWAPWRITE;
-
+    
 	for(pass = 0; pass < 10 && retry; pass++) {
 		retry = 0;
-
+        /* page是主要遍历的页，page2是page在from中的下一个页 */
 		list_for_each_entry_safe(page, page2, from, lru) {
+		    /* 如果进程需要调度，则调度 */
 			cond_resched();
 
 			if (PageHuge(page))
@@ -1424,6 +1436,7 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
 						put_new_page, private, page,
 						pass > 2, mode, reason);
 			else
+                /* 此页为非大页处理，完成migratepage到freepages的转移 */
 				rc = unmap_and_move(get_new_page, put_new_page,
 						private, page, pass > 2, mode,
 						reason);
@@ -1433,9 +1446,11 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
 				nr_failed++;
 				goto out;
 			case -EAGAIN:
+                /* 重试 */
 				retry++;
 				break;
 			case MIGRATEPAGE_SUCCESS:
+                /* 成功 */
 				nr_succeeded++;
 				break;
 			default:
@@ -1453,12 +1468,13 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
 	nr_failed += retry;
 	rc = nr_failed;
 out:
+    /* 统计 */
 	if (nr_succeeded)
 		count_vm_events(PGMIGRATE_SUCCESS, nr_succeeded);
 	if (nr_failed)
 		count_vm_events(PGMIGRATE_FAIL, nr_failed);
 	trace_mm_migrate_pages(nr_succeeded, nr_failed, mode, reason);
-
+     /* 恢复PF_SWAPWRITE标记 */
 	if (!swapwrite)
 		current->flags &= ~PF_SWAPWRITE;
 
