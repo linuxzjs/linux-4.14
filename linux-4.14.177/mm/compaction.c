@@ -1601,15 +1601,22 @@ static enum compact_result __compaction_suitable(struct zone *zone, int order,
 					unsigned long wmark_target)
 {
 	unsigned long watermark;
-
+    /*
+     * 如果echo 1 > /proc/sys/vm/compact_memory手动请求释放强制进行内存碎片整理则return COMPACT_CONTINUE
+     */
 	if (is_via_compact_memory(order))
 		return COMPACT_CONTINUE;
-
+    /* 获取请求内存压缩zone区域的watermask内存水印，也就是zone zone_watermark[min]  最小内存界限  */
 	watermark = zone->watermark[alloc_flags & ALLOC_WMARK_MASK];
 	/*
 	 * If watermarks for high-order allocation are already met, there
 	 * should be no need for compaction at all.
 	 */
+	/*
+	 * 如果zone的freepage > watermask + zone->lowmem_reserve[classzone_idx]保留区域则说明该区域可以进行内存分配
+	 * 所以直接return compact_success 结束内存压缩整理，负责说明zone当中空闲的内存不足以满足一次性分配2^order个page,
+	 * 继续向下做内存碎片整理
+     */
 	if (zone_watermark_ok(zone, order, watermark, classzone_idx,
 								alloc_flags))
 		return COMPACT_SUCCESS;
@@ -1628,23 +1635,36 @@ static enum compact_result __compaction_suitable(struct zone *zone, int order,
 	 * ALLOC_CMA is used, as pages in CMA pageblocks are considered
 	 * suitable migration targets
 	 */
+	/*
+	 * 如果order > PAGE_ALLOC_COSTLY_ORDER则watermask = low_wmark_pages(zone) 
+	 * 如果order <= PAGE_ALLOC_COSTLY_ORDER则watermask =  min_wmark_pages(zone)
+	 * 同时这个基础上watermask = watermask + 2*2^order 作为zone的最低水位赋值给zone_watermark[min]
+     */
 	watermark = (order > PAGE_ALLOC_COSTLY_ORDER) ?
 				low_wmark_pages(zone) : min_wmark_pages(zone);
 	watermark += compact_gap(order);
+    /*
+     * 使用ALLOC_CMA从CMA当中获取内存page，如果zone freepages < min + z->lowmem_reserve[classzone_idx] return false
+     * 则说明zone的空闲页面不足，无法满足order的页面内存分配请求，说明zone当中根本就没有足够的page 所以就不在这个zone当中做内存的整理直接skip跳过就可以了
+     * 如果return true则说明存在足够的内存可供使用则return compact_continue 继续扫描这个zone，
+     */
 	if (!__zone_watermark_ok(zone, 0, watermark, classzone_idx,
 						ALLOC_CMA, wmark_target))
 		return COMPACT_SKIPPED;
 
 	return COMPACT_CONTINUE;
 }
-
+/* 判断该zone是否可以做内存碎片压缩整理 */
 enum compact_result compaction_suitable(struct zone *zone, int order,
 					unsigned int alloc_flags,
 					int classzone_idx)
 {
 	enum compact_result ret;
 	int fragindex;
-
+    /*
+     * 根据watermask判断zone中离散的page是否满足2^order的内存分配请求，如果满足则继续对zone进行内存的compact整理zone的内存碎片
+     * 说明该zone时可以做内存碎片的压缩整理的。
+     */
 	ret = __compaction_suitable(zone, order, alloc_flags, classzone_idx,
 				    zone_page_state(zone, NR_FREE_PAGES));
 	/*
@@ -1663,7 +1683,13 @@ enum compact_result compaction_suitable(struct zone *zone, int order,
 	 * excessive compaction for costly orders, but it should not be at the
 	 * expense of system stability.
 	 */
+	/* 如果return返回值为COMPACT_CONTINUE，且order        > PAGE_ALLOC_COSTLY_ORDER(3)则进入一下判断当中 */
 	if (ret == COMPACT_CONTINUE && (order > PAGE_ALLOC_COSTLY_ORDER)) {
+        /* 
+         * 为了确定zone区域是否执行压缩，找到所请求区域zone和顺序的碎片系数。
+         * 如果碎片系数值返回-1000，则存在要分配的页面，因此不需要压缩。
+         * 在其他情况下，该值在0到500的范围内，并且如果它小于sysctl_extfrag_threshold，则直接return COMPACT_NOT_SUITABLE_ZONE不执行压缩
+         */
 		fragindex = fragmentation_index(zone, order);
 		if (fragindex >= 0 && fragindex <= sysctl_extfrag_threshold)
 			ret = COMPACT_NOT_SUITABLE_ZONE;

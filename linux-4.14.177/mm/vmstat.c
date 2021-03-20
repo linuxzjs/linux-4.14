@@ -954,18 +954,25 @@ static void fill_contig_page_info(struct zone *zone,
 	info->free_pages = 0;
 	info->free_blocks_total = 0;
 	info->free_blocks_suitable = 0;
-
+    /*
+     * zone区域当中统计freepage空闲页面的个数
+     */
 	for (order = 0; order < MAX_ORDER; order++) {
 		unsigned long blocks;
 
 		/* Count number of free blocks */
+        /* 根据order统计zone当中还存在多少个空心啊的block，对info->free_blocks_total += blocks */
 		blocks = zone->free_area[order].nr_free;
 		info->free_blocks_total += blocks;
 
 		/* Count free base pages */
+        /* 根据空闲的block可知还存在多少空闲的freepage 并做统计 info->free_pages             += block*2^order 计算出zone区域中空闲的freepage个数 */
 		info->free_pages += blocks << order;
 
 		/* Count the suitable free blocks */
+        /* 如果order > suitable_order(内存分配请求的order)则统出超过  suitable_order的情况下的order ~ max_order的空闲页面个数
+         * 对高于请求order的空闲块的数量进行求和
+         */
 		if (order >= suitable_order)
 			info->free_blocks_suitable += blocks <<
 						(order - suitable_order);
@@ -981,15 +988,18 @@ static void fill_contig_page_info(struct zone *zone,
  */
 static int __fragmentation_index(unsigned int order, struct contig_page_info *info)
 {
-	unsigned long requested = 1UL << order;
+	unsigned long requested = 1UL << order;//获取需要分配的页面数
 
 	if (WARN_ON_ONCE(order >= MAX_ORDER))
 		return 0;
-
+    /* 如果free_block_total = 0 则说明zone当中没有空闲的block，则完全无法进行内存压缩分配直接return 0 */
 	if (!info->free_blocks_total)
 		return 0;
 
 	/* Fragmentation index only makes sense when a request would fail */
+    /* 如果info->free_blocks_suitable 不为0 则说明至少是存在一个以上的free block空闲block，并且这个block           的order > 内存分配请求的order 
+     * 也就是zone是不需要进行内存的碎片压缩就可以满足内存的requested分配请求的，直接return -1000，
+     */
 	if (info->free_blocks_suitable)
 		return -1000;
 
@@ -998,6 +1008,11 @@ static int __fragmentation_index(unsigned int order, struct contig_page_info *in
 	 *
 	 * 0 => allocation would fail due to lack of memory
 	 * 1 => allocation would fail due to fragmentation
+	 */
+	/* 1000 – (((总可用页面数 x 1000)/ 所需页面数+ 1000)) / 总可用块数)
+	 * 越接近0，内存不足，并且无法通过内存碎片整理获得足够的page,所以不允许压缩
+	 * 越接近1，内存不足，但是存在足够的碎片化的page，可以通过compact获得足够的连续的page供上层分配使用
+	 * 也就是越接近1，越能压缩碎片化的页面，说明总的可用页面数越多，说明该zone是能够进行内存碎片整理的
 	 */
 	return 1000 - div_u64( (1000+(div_u64(info->free_pages * 1000ULL, requested))), info->free_blocks_total);
 }
