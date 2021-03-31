@@ -2865,20 +2865,27 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
 	struct zoneref *z;
 	struct zone *zone;
 retry:
-	delayacct_freepages_start();
-
+	delayacct_freepages_start();//计算开始内存回收时的时间与delayacct_freepages_end相呼应
+    /* 是否使用全局回收变量，如果是则增加ALLOCSTALL stat */
 	if (global_reclaim(sc))
 		__count_zid_vm_events(ALLOCSTALL, sc->reclaim_idx, 1);
 
 	do {
+        /*
+         * 
+         */
 		vmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,
 				sc->priority);
+        /* 重置扫描次数 */
 		sc->nr_scanned = 0;
+        /* 回收页面，更新sc结构体参数 */
 		shrink_zones(zonelist, sc);
-
+        /* 如果扫描回收的空闲页数大于等于扫描的非活动页面则直接break，说明该zone当中的非活动页面都已经被成功回收
+         * 如果扫描回收的空闲页面数小于非活动页面数则继续向下操作
+         */
 		if (sc->nr_reclaimed >= sc->nr_to_reclaim)
 			break;
-
+        /* 已准备好压缩，则它会跳出循环进行处理，这里内存回收时无法操作的，需要先进行内存compaction压缩操作 */
 		if (sc->compaction_ready)
 			break;
 
@@ -2886,11 +2893,15 @@ retry:
 		 * If we're getting trouble reclaiming, start doing
 		 * writepage even in laptop mode.
 		 */
+		/*
+		 * 将优先级再提高两个步骤来设置处理时的写页功能
+         */
 		if (sc->priority < DEF_PRIORITY - 2)
 			sc->may_writepage = 1;
-	} while (--sc->priority >= 0);
-
+	} while (--sc->priority >= 0);//将优先级提高到最高为0
+   
 	last_pgdat = NULL;
+     /* 更新该zone节点或该节点的memcg lru的引用 */
 	for_each_zone_zonelist_nodemask(zone, z, zonelist, sc->reclaim_idx,
 					sc->nodemask) {
 		if (zone->zone_pgdat == last_pgdat)
@@ -2898,17 +2909,19 @@ retry:
 		last_pgdat = zone->zone_pgdat;
 		snapshot_refaults(sc->target_mem_cgroup, zone->zone_pgdat);
 	}
-
+    /* 获取页面回收后的时间 */
 	delayacct_freepages_end();
-
+    /* 内存回收的空闲页面的数量，如果为真则直接return nr_reclaimed 返回回收成功的pages页的数量                         */
 	if (sc->nr_reclaimed)
 		return sc->nr_reclaimed;
 
 	/* Aborted reclaim to try compaction? don't OOM, then */
+    /* 内存回收终止，尝试进行内存compaction碎片整理，不要触发oom ，return 1 */
 	if (sc->compaction_ready)
 		return 1;
 
 	/* Untapped cgroup reserves?  Don't OOM, retry. */
+    /* 设置了sc-> memcg_low_skipped，则仅在第一次重试时，优先级才变回原始请求优先级 */
 	if (sc->memcg_low_skipped) {
 		sc->priority = initial_priority;
 		sc->memcg_low_reclaim = 1;
@@ -2926,29 +2939,40 @@ static bool allow_direct_reclaim(pg_data_t *pgdat)
 	unsigned long free_pages = 0;
 	int i;
 	bool wmark_ok;
-
+    /* 如果内存回收失败此时超过MAX_RECLAIM_RETRIES也就是16次时，则直接return true,不在进行内存的回收操作
+     * 这里可以看作时一种保护机制，防止对同一个zone进行无限的回收
+     */
 	if (pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES)
 		return true;
-
+    /* 查询低于ZONE_NORMAL的zone类型的地址，这里我们时ARM64为架构只有一个Node0，所以按照这样只能从Node0当中获取内存 */
 	for (i = 0; i <= ZONE_NORMAL; i++) {
+        /* 获取当前node节点当中的zone，根据ARM64架构分析只有NODE0，也就是获取node0当中的ZONE_DMA、ZONE_NORMAL区域 */
 		zone = &pgdat->node_zones[i];
-		if (!managed_zone(zone))
+		if (!managed_zone(zone))//判断当前zone是否在buddy system当中，如果不在则continue，跳过该zone，如果存在则继续向下执行
 			continue;
-
+        /* 判断zone当中可回收的page是否为NULL，如果为空则说明该zone当中不存在可以回收的page，则直接continue跳过该zone,扫描下一个zone */
 		if (!zone_reclaimable_pages(zone))
 			continue;
-
+        /*
+         * pfmemalloc_reserve = pfmemalloc_reserve + z->watermark[WMARK_MIN]获取ZONE_DMA、ZONE_NORMAL的保留的最小的page数
+         * free_pages 则是获取zone当中可用的NR_FREE_PAGES空闲页，获取ZONE_DMA、ZONE_NORMAL的空闲的page
+         */
 		pfmemalloc_reserve += min_wmark_pages(zone);
 		free_pages += zone_page_state(zone, NR_FREE_PAGES);
 	}
 
 	/* If there are no reserves (unexpected config) then do not throttle */
+    /* 如果pfmemalloc_reserve =   0则return true说明该zone当中没有保留的空闲页则不再进行内存内存回收                       */
 	if (!pfmemalloc_reserve)
 		return true;
-
+    /* 如果空闲页面的总数大于lowmem区域的总最小水印值的50％，则wmark_ok = true，说明存在足够的freepage可供分配，无需做内存回收操作
+     * 如果空闲页面的总述小于lowmem区域的最小水印的50% 则wmark_ok = false，说明是需要对该zone或者是node进行内存回收的
+     */
 	wmark_ok = free_pages > pfmemalloc_reserve / 2;
 
 	/* kswapd must be awake if processes are being throttled */
+    /* 如果lowmem区域的可用freepage空闲页面小于最小水印的50％，则当前任务进入睡眠状态，唤醒kswapd，进行异步回收操作。
+     */
 	if (!wmark_ok && waitqueue_active(&pgdat->kswapd_wait)) {
 		pgdat->kswapd_classzone_idx = min(pgdat->kswapd_classzone_idx,
 						(enum zone_type)ZONE_NORMAL);
@@ -2981,6 +3005,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	 * committing a transaction where throttling it could forcing other
 	 * processes to block on log_wait_commit().
 	 */
+	/* 如果是内核线程则直接跳转到out，不做内存回收操作 */
 	if (current->flags & PF_KTHREAD)
 		goto out;
 
@@ -2988,6 +3013,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	 * If a fatal signal is pending, this process should not throttle.
 	 * It should return quickly so it can exit and free its memory
 	 */
+	/* 如果当前current进程在SIGKILL信号的任务的情况下，则直接return false */
 	if (fatal_signal_pending(current))
 		goto out;
 
@@ -3005,12 +3031,17 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	 * for remote pfmemalloc reserves and processes on different nodes
 	 * should make reasonable progress.
 	 */
+	/* 扫描zonelist，如果zone > ZONE_NORMAL则直接continue 跳过该zone
+	 * 对于ARM64而言能够扫描的只有ZONE_DMA、ZONE_NORMAL
+     */
 	for_each_zone_zonelist_nodemask(zone, z, zonelist,
 					gfp_zone(gfp_mask), nodemask) {
+		/*在arm64当中只能扫描ZONE_NORMAL、ZONE_MOVABLE */
 		if (zone_idx(zone) > ZONE_NORMAL)
 			continue;
 
 		/* Throttle based on the first usable node */
+        /* 获取当前zone类型的pgdat变量信息该变量当中包含node信息，判断该zone是否允许直接回收操作 */
 		pgdat = zone->zone_pgdat;
 		if (allow_direct_reclaim(pgdat))
 			goto out;
@@ -3018,6 +3049,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	}
 
 	/* If no zone was usable by the allocation flags then do not throttle */
+    /* 如果没有可用的zone则直接跳转到out处，说明zone无法做内存回收操作，直接结束操作       */
 	if (!pgdat)
 		goto out;
 
@@ -3032,6 +3064,10 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	 * blocked waiting on the same lock. Instead, throttle for up to a
 	 * second before continuing.
 	 */
+	/* 如果gfp_mask不使用文件系统则可以进行直接回收请求，
+	 * 该操作最对可以执行HZ也就是1s,无论是否结束都，内存直接回收判断都将结束，且移至check_pending标签
+	 * 此处相当于引入了一个timeout机制，方式内存回收循环造成系统卡死
+	 */
 	if (!(gfp_mask & __GFP_FS)) {
 		wait_event_interruptible_timeout(pgdat->pfmemalloc_wait,
 			allow_direct_reclaim(pgdat), HZ);
@@ -3040,11 +3076,12 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	}
 
 	/* Throttle until kswapd wakes the process */
+    /* 如果使用了文件系统进行直接回收的情况下，它会唤醒kswapd以获得空闲页，然后休眠直到允许直接回收 */
 	wait_event_killable(zone->zone_pgdat->pfmemalloc_wait,
 		allow_direct_reclaim(pgdat));
 
 check_pending:
-	if (fatal_signal_pending(current))
+	if (fatal_signal_pending(current))//如果向当前进程请求了SIGKILL信号，则返回true则说明无法进行内存回收，否则返回false可以进行内存回收
 		return true;
 
 out:
@@ -3056,14 +3093,26 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 {
 	unsigned long nr_reclaimed;
 	struct scan_control sc = {
+        /* 最大回收页框数：32个页框       */
 		.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		/* 获取当前进程分配内存的设置 */
 		.gfp_mask = current_gfp_context(gfp_mask),
+		/* 获取当前zone的类型，是ZONE_NORMAL;ZONE_DMA;ZONE_MOVABLE等类型是从真没的zone当中获取的内存 */
 		.reclaim_idx = gfp_zone(gfp_mask),
+		/* 申请内存的order，通过order可知当前申请内存的大小2^order */
 		.order = order,
+		/* 获取当前node的类型 */
 		.nodemask = nodemask,
+		/* 优先级为默认的12 */
 		.priority = DEF_PRIORITY,
+		/* 与/proc/sys/vm/laptop_mode文件有关
+         * laptop_mode为0，则允许进行回写操作，即使允许回写，直接内存回收也不能对脏文件页进行回写
+         * 不过允许回写时，可以对非文件页进行回写
+         */
 		.may_writepage = !laptop_mode,
+		 /* 能否进行unmap操作，就是将所有映射了此页的页表项清空 */
 		.may_unmap = 1,
+		 /* 是否能够进行swap交换，如果不能，在内存回收时则不扫描匿名页lru链表 */
 		.may_swap = 1,
 	};
 
@@ -3072,6 +3121,10 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 	 * 1 is returned so that the page allocator does not OOM kill at this
 	 * point.
 	 */
+	/*
+	 * 判断当前zonelist当中是否存在可以做内存回收的zone区域，如果存在则直接return true，则zone无需做内存回收直接return 1
+	 * 如果当前zonelist当中zone的空闲freepage小于lowmem_reserve的一半则需要向下执行做do_try_to_free_pages完成zonelist的内存回收操作
+     */
 	if (throttle_direct_reclaim(sc.gfp_mask, zonelist, nodemask))
 		return 1;
 
@@ -3079,7 +3132,10 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 				sc.may_writepage,
 				sc.gfp_mask,
 				sc.reclaim_idx);
-
+    /* 回收的page数量，
+     * returns:	0,说明没有page可以回收
+     * 如果回收成功则显示的是the number of pages reclaimed回收页面的个数    
+     */
 	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
 
 	trace_mm_vmscan_direct_reclaim_end(nr_reclaimed);

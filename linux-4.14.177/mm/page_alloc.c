@@ -3721,7 +3721,7 @@ __perform_reclaim(gfp_t gfp_mask, unsigned int order,
 	struct reclaim_state reclaim_state;
 	int progress;
 	unsigned int noreclaim_flag;
-
+    /* 进程发生调度，让出cpu当前进程休眠              */
 	cond_resched();
 
 	/* We now go into synchronous reclaim */
@@ -3751,7 +3751,9 @@ __alloc_pages_direct_reclaim(gfp_t gfp_mask, unsigned int order,
 {
 	struct page *page = NULL;
 	bool drained = false;
-
+    /* 回收内存，如果内存回收失败则直接return NULL，
+     * 如果内存回收成功则继续向下执行，get_page_from_freelist分配内存
+     */
 	*did_some_progress = __perform_reclaim(gfp_mask, order, ac);
 	if (unlikely(!(*did_some_progress)))
 		return NULL;

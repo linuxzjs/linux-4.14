@@ -99,7 +99,7 @@ enum vmpressure_modes {
 	VMPRESSURE_LOCAL,
 	VMPRESSURE_NUM_MODES,
 };
-
+/* low level正常回收，medium level就是开始swaping，critical就是内存严重不足启动OOM释放内存 */
 static const char * const vmpressure_str_levels[] = {
 	[VMPRESSURE_LOW] = "low",
 	[VMPRESSURE_MEDIUM] = "medium",
@@ -111,7 +111,7 @@ static const char * const vmpressure_str_modes[] = {
 	[VMPRESSURE_HIERARCHY] = "hierarchy",
 	[VMPRESSURE_LOCAL] = "local",
 };
-
+/* 根据压力的值，得出内存回收的压力等级 */
 static enum vmpressure_levels vmpressure_level(unsigned long pressure)
 {
 	if (pressure >= vmpressure_level_critical)
@@ -132,6 +132,7 @@ static enum vmpressure_levels vmpressure_calc_level(unsigned long scanned,
 	 * slab pages. shrink_node() just adds reclaimed pages without a
 	 * related increment to scanned pages.
 	 */
+	/* 如果回收的内存大于扫描的内存数量说明存在足够的内存足够的，正常的内存回收即可，所以此时直接goto                               out此时内存回收的压力为0 */
 	if (reclaimed >= scanned)
 		goto out;
 	/*
@@ -141,13 +142,14 @@ static enum vmpressure_levels vmpressure_calc_level(unsigned long scanned,
 	 * scanned. This makes it possible to set desired reaction time
 	 * and serves as a ratelimit.
 	 */
+	/* 完成内存压力计算 */
 	pressure = scale - (reclaimed * scale / scanned);
 	pressure = pressure * 100 / scale;
 
 out:
 	pr_debug("%s: %3lu  (s: %lu  r: %lu)\n", __func__, pressure,
 		 scanned, reclaimed);
-
+    /* 根据压力的值返回内存回收压力等级 */
 	return vmpressure_level(pressure);
 }
 
@@ -183,6 +185,7 @@ static bool vmpressure_event(struct vmpressure *vmpr,
 
 static void vmpressure_work_fn(struct work_struct *work)
 {
+    /* 获取vmpr工作队列的值 */
 	struct vmpressure *vmpr = work_to_vmpressure(work);
 	unsigned long scanned;
 	unsigned long reclaimed;
@@ -199,19 +202,21 @@ static void vmpressure_work_fn(struct work_struct *work)
 	 * here. No need for any locks here since we don't care if
 	 * vmpr->reclaimed is in sync.
 	 */
+	/* 将tree_scanned赋值给scanned，获取扫描page的页数，如果扫描页数为0则直接return */
 	scanned = vmpr->tree_scanned;
 	if (!scanned) {
 		spin_unlock(&vmpr->sr_lock);
 		return;
 	}
-
+    /* 将tree_reclaimed赋值给reclaimed获取tree回收页面的个数 */
 	reclaimed = vmpr->tree_reclaimed;
+    /* 设置tree_scanned、tree_reclaimed为0，对这两个变量进行初始化操作 */
 	vmpr->tree_scanned = 0;
 	vmpr->tree_reclaimed = 0;
 	spin_unlock(&vmpr->sr_lock);
-
+    /* 计算tree 内存回收的压力等级 */
 	level = vmpressure_calc_level(scanned, reclaimed);
-
+    /* 遍历由parent组成的memcg的vmpressure值到最大值，并将事件通知满足条件的vmpressure侦听器 */
 	do {
 		if (vmpressure_event(vmpr, level, ancestor, signalled))
 			signalled = true;
@@ -243,6 +248,7 @@ static void vmpressure_work_fn(struct work_struct *work)
 void vmpressure(gfp_t gfp, struct mem_cgroup *memcg, bool tree,
 		unsigned long scanned, unsigned long reclaimed)
 {
+    /* 获取memcg的vmpressure信息 */
 	struct vmpressure *vmpr = memcg_to_vmpressure(memcg);
 
 	/*
@@ -256,6 +262,7 @@ void vmpressure(gfp_t gfp, struct mem_cgroup *memcg, bool tree,
 	 * Indirect reclaim (kswapd) sets sc->gfp_mask to GFP_KERNEL, so
 	 * we account it too.
 	 */
+	/* 如果内存分配请求当中不存在任何一种：HIGHMEM高端内存, MOVABLE可移动内存，IO类型以及FS文件系统内存则直接return，不做vmpressure计算 */
 	if (!(gfp & (__GFP_HIGHMEM | __GFP_MOVABLE | __GFP_IO | __GFP_FS)))
 		return;
 
@@ -267,37 +274,54 @@ void vmpressure(gfp_t gfp, struct mem_cgroup *memcg, bool tree,
 	 * (scanning depth) goes too high (deep), we will be notified
 	 * through vmpressure_prio(). But so far, keep calm.
 	 */
+	/* 如果设置scanned    = 0则直接return结束该函数，负责向下执行完成扫描这个scannd代表page，如果为0说明memcg当中不存在任何的可以使用的page则没有必要进行后续操作
+	 */
 	if (!scanned)
 		return;
-
+    /* 如果tree = true则走上面的处理流程，负责如果tree           = false则进入else的处理流程      */
 	if (tree) {
-		spin_lock(&vmpr->sr_lock);
+		spin_lock(&vmpr->sr_lock);//获取自旋锁
+		/* 分两步：
+         * vmpr->tree_scanned += scanned;将扫描的pages页数自加到tree_scanned
+         * scanned = vmpr->tree_scanned;更新vmpr scanned
+         */
 		scanned = vmpr->tree_scanned += scanned;
+        /* 更新tree树回收的page页数 */
 		vmpr->tree_reclaimed += reclaimed;
+        /* 解锁 */
 		spin_unlock(&vmpr->sr_lock);
-
+        /* 如果扫描到的page小于512个page则直接return结束该函数 */
 		if (scanned < vmpressure_win)
 			return;
+        /* 执行vmpressure_work_fn函数完成内存压力计算 */
 		schedule_work(&vmpr->work);
 	} else {
 		enum vmpressure_levels level;
 
 		/* For now, no users for root-level efficiency */
+        /* 记录memcg的检索效率以通知内部内核用户，如果未指定memcg，则该函数将中止 */
 		if (!memcg || memcg == root_mem_cgroup)
 			return;
-
+        /* 执行过程同上 */
 		spin_lock(&vmpr->sr_lock);
+        /* 分两步：
+         * vmpr->scanned += scanned;将扫描的pages页数自加到scanned
+         * scanned = vmpr->scanned;更新vmpr scanned
+         */
 		scanned = vmpr->scanned += scanned;
+        /* 统计回收到的页面总数 */
 		reclaimed = vmpr->reclaimed += reclaimed;
+        /* 如果扫描的page小于512则直接解锁并return */
 		if (scanned < vmpressure_win) {
 			spin_unlock(&vmpr->sr_lock);
 			return;
 		}
+        /* 清空回收的页面数，设置vmpr—>reclaimed = 0 */
 		vmpr->scanned = vmpr->reclaimed = 0;
 		spin_unlock(&vmpr->sr_lock);
-
+        /* 计算的vmpressure级别也就是内存回收的压力等级 */
 		level = vmpressure_calc_level(scanned, reclaimed);
-
+        /* 如果等级超过VMPRESSURE_LOW，则将memcg的socket_pressure设置为当前时间之后1秒钟的滴答值 */
 		if (level > VMPRESSURE_LOW) {
 			/*
 			 * Let the socket buffer allocator know that
@@ -329,6 +353,11 @@ void vmpressure_prio(gfp_t gfp, struct mem_cgroup *memcg, int prio)
 	 * We only use prio for accounting critical level. For more info
 	 * see comment for vmpressure_level_critical_prio variable above.
 	 */
+	/* 如果prio的优先级大于vmpressure_level_critical_prio = ilog2(100 / 10);
+	 * 也就是prio > 3则直接return；关于优先级需要明确的是prio越小则优先级越高
+     * 优先级越低，一次扫描的页框数量就越多
+     * 优先级越高，一次扫描的数量就越少
+	 */
 	if (prio > vmpressure_level_critical_prio)
 		return;
 
@@ -338,6 +367,9 @@ void vmpressure_prio(gfp_t gfp, struct mem_cgroup *memcg, int prio)
 	 * range vmscan. Passing scanned = vmpressure_win, reclaimed = 0
 	 * to the vmpressure() basically means that we signal 'critical'
 	 * level.
+	 */
+	/* 
+	 * 如果prio下降到threshold阈值以下，即优先级升高，则收缩器在长时间扫描之前更新vmpressure信息
 	 */
 	vmpressure(gfp, memcg, true, vmpressure_win, 0);
 }
