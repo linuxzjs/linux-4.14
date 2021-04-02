@@ -2598,7 +2598,11 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
 	}
 	return true;
 }
-
+                    
+/* 对zone进行内存回收 
+* 返回是否回收到了页框，而不是十分回收到了sc中指定数量的页框
+* 即使没回收到sc中指定数量的页框，只要回收到了页框，就返回真
+*/
 static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
 	struct reclaim_state *reclaim_state = current->reclaim_state;
@@ -2606,6 +2610,7 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 	bool reclaimable = false;
 
 	do {
+         /* 当内存回收是针对整个zone时，sc->target_mem_cgroup为NULL */
 		struct mem_cgroup *root = sc->target_mem_cgroup;
 		struct mem_cgroup_reclaim_cookie reclaim = {
 			.pgdat = pgdat,
@@ -2613,10 +2618,14 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 		};
 		unsigned long node_lru_pages = 0;
 		struct mem_cgroup *memcg;
-
+        /* 记录本次回收开始前回收到的页框数量，第一次是0 */
 		nr_reclaimed = sc->nr_reclaimed;
+        /* 记录本次内存回收前扫描的页框的数量 */
 		nr_scanned = sc->nr_scanned;
-
+        /* 获取最上层的memcg
+         * 如果没有指定开始的root，则默认是root_mem_cgroup
+         * root_mem_cgroup管理的每个zone的lru链表就是每个zone完整的lru链表
+         */
 		memcg = mem_cgroup_iter(root, NULL, &reclaim);
 		do {
 			unsigned long lru_pages;
@@ -2755,19 +2764,23 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 	 * allowed level, force direct reclaim to scan the highmem zone as
 	 * highmem pages could be pinning lowmem pages storing buffer_heads
 	 */
+	 /* 将sc->gfp_mask赋值给orig_mask，这里的作用就相当于做了一个备份一样 */
 	orig_mask = sc->gfp_mask;
+    /* 如果缓冲头数超过了最大允许水平，则在page页扫描中应该包含高端内存区域 */
 	if (buffer_heads_over_limit) {
 		sc->gfp_mask |= __GFP_HIGHMEM;
 		sc->reclaim_idx = gfp_zone(sc->gfp_mask);
 	}
-
+    /* 遍历zonelist，回收可用的内存空间 */
 	for_each_zone_zonelist_nodemask(zone, z, zonelist,
 					sc->reclaim_idx, sc->nodemask) {
 		/*
 		 * Take care memory controller reclaiming has small influence
 		 * to global LRU.
 		 */
+		 /* 判断检索的对象是否为全局lru，如果是则进入判断当中 */
 		if (global_reclaim(sc)) {
+            /* 如果zone区域中，由于GFP_KERNEL和__GFP_HARDWALL标志的设置导致在内存回收时不允许使用该zone区域，则continue跳过该zone区域 */
 			if (!cpuset_zone_allowed(zone,
 						 GFP_KERNEL | __GFP_HARDWALL))
 				continue;
@@ -2780,6 +2793,12 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 			 * reclamation is disruptive enough to become a
 			 * noticeable problem, like transparent huge
 			 * page allocations.
+			 */
+			/* 同时满足三个条件则跳过该zone区域：
+			 * 1. CONFIG_COMPACTION内存碎片整理功能开启
+			 * 2. 需要分配的内存order > PAGE_ALLOC_COSTLY_ORDER也就是昂贵的order = 3
+			 * 3. compaction_ready(zone, sc)说明该zone区域可以通过comact内存碎片整理，实现内存分配的，
+			 * 基于着三点,如果同时满足则不在对该zone进行内存回收操作，直接进行内存碎片整理即可。
 			 */
 			if (IS_ENABLED(CONFIG_COMPACTION) &&
 			    sc->order > PAGE_ALLOC_COSTLY_ORDER &&
@@ -2794,6 +2813,7 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 			 * node may be shrunk multiple times but in that case
 			 * the user prefers lower zones being preserved.
 			 */
+			/* 如果zone->zone_pgdat = last_pgdat说明该zone已经进行过内存回收操作了，这里直接continue跳过该zone */
 			if (zone->zone_pgdat == last_pgdat)
 				continue;
 
@@ -2803,6 +2823,11 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 			 * scanned pages. This works for global memory pressure
 			 * and balancing, not for a memcg's limit.
 			 */
+			/*
+			 * 获取zone回收能够获得的page个数，
+			 * 并将zone内存回收获得pages数目给nr_reclaimed + nr_soft_reclaimed回收page数，
+			 * nr_scanned + nr_soft_scanned获得扫描的次数
+             */
 			nr_soft_scanned = 0;
 			nr_soft_reclaimed = mem_cgroup_soft_limit_reclaim(zone->zone_pgdat,
 						sc->order, sc->gfp_mask,
@@ -2813,9 +2838,11 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 		}
 
 		/* See comment about same check for global reclaim above */
+        /* 如果zone->zone_pgdat = last_pgdat说明该zone已经进行过内存回收操作了，这里直接continue跳过该zone */
 		if (zone->zone_pgdat == last_pgdat)
 			continue;
 		last_pgdat = zone->zone_pgdat;
+        /* 对该zone进行下一步的内存回收操作 */
 		shrink_node(zone->zone_pgdat, sc);
 	}
 
@@ -2823,6 +2850,7 @@ static void shrink_zones(struct zonelist *zonelist, struct scan_control *sc)
 	 * Restore to original mask to avoid the impact on the caller if we
 	 * promoted it to __GFP_HIGHMEM.
 	 */
+	/*将备份的orig_mask重新赋值给sc->gfp_mask完成备份的目的 */
 	sc->gfp_mask = orig_mask;
 }
 
@@ -2872,7 +2900,8 @@ retry:
 
 	do {
         /*
-         * 
+         * 完成内存回收压力等级的计算，通过不同的压力等级判断后续内存回收的方式
+         * low level正常回收，medium level就是开始swaping，critical就是内存严重不足启动OOM释放内存
          */
 		vmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,
 				sc->priority);
