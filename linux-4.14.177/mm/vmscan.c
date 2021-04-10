@@ -320,11 +320,13 @@ static unsigned long do_shrink_slab(struct shrink_control *shrinkctl,
 	long freeable;
 	long nr;
 	long new_nr;
+    /* 获取收缩slab 的zone 区域值 */
 	int nid = shrinkctl->nid;
+    /* 如果shrinker收缩器中未指定一次要处理的slab cache 对象的数量，则替换SHRINK_BATCH 128， */
 	long batch_size = shrinker->batch ? shrinker->batch
 					  : SHRINK_BATCH;
 	long scanned = 0, next_deferred;
-
+    /* 这是一个回调函数，如果获取的空闲page个数为0，则直接return                0，结束shrinker的收缩操作 */
 	freeable = shrinker->count_objects(shrinker, shrinkctl);
 	if (freeable == 0)
 		return 0;
@@ -334,9 +336,11 @@ static unsigned long do_shrink_slab(struct shrink_control *shrinkctl,
 	 * and zero it so that other concurrent shrinker invocations
 	 * don't also do this scanning work.
 	 */
+	/* shrinker回收的slab cache页面数 */
 	nr = atomic_long_xchg(&shrinker->nr_deferred[nid], 0);
-
+    /* 扫描总的slab   cache数 */
 	total_scan = nr;
+    /*  */
 	delta = (4 * nr_scanned) / shrinker->seeks;
 	delta *= freeable;
 	do_div(delta, nr_eligible + 1);
@@ -464,13 +468,19 @@ static unsigned long shrink_slab(gfp_t gfp_mask, int nid,
 {
 	struct shrinker *shrinker;
 	unsigned long freed = 0;
-
+    /* 如果memcg为真
+     * 且memcg_kmem_enabled、mem_cgroup_onlin任何一个为假的话说明memcg不在线，则直接return 0结束页面的收缩
+     * 此时代表该zone没有任何可以进行页面的伸缩的可能性，同时放弃对该zone的尝试
+     */
 	if (memcg && (!memcg_kmem_enabled() || !mem_cgroup_online(memcg)))
 		return 0;
-
+    /* 如果被扫描的page页数为0,则设置被扫描的最大的页面数为SWAP_CLUSTER_MAX也就是32 */
 	if (nr_scanned == 0)
 		nr_scanned = SWAP_CLUSTER_MAX;
-
+    /* 
+     * 如果shrinker_rwsem没有获取到锁则直接跳转到out处，return 1
+     * 此时则继续对该zone区域进行收缩操作
+     */
 	if (!down_read_trylock(&shrinker_rwsem)) {
 		/*
 		 * If we would return 0, our callers would understand that we
@@ -481,7 +491,7 @@ static unsigned long shrink_slab(gfp_t gfp_mask, int nid,
 		freed = 1;
 		goto out;
 	}
-
+    /* 遍历shrinker_list完成slab cahce的收缩回收操作 */
 	list_for_each_entry(shrinker, &shrinker_list, list) {
 		struct shrink_control sc = {
 			.gfp_mask = gfp_mask,
@@ -494,13 +504,16 @@ static unsigned long shrink_slab(gfp_t gfp_mask, int nid,
 		 * SHRINKER_MEMCG_AWARE flag and call all shrinkers
 		 * passing NULL for memcg.
 		 */
+		 /* 如果memcg功能开启，且memcg没有设置SHRINKER_MEMCG_AWARE该类型，则直接continue跳过该shrinker */
 		if (memcg_kmem_enabled() &&
 		    !!memcg != !!(shrinker->flags & SHRINKER_MEMCG_AWARE))
 			continue;
-
+        /* 如果设flag类型没有设置SHRINKER_NUMA_AWARE则设置sc.nid         = 0,
+         * 不再slab cache的扫描操作
+         */
 		if (!(shrinker->flags & SHRINKER_NUMA_AWARE))
 			sc.nid = 0;
-
+        /* 完成对slab   cache的扫描回收操作 */
 		freed += do_shrink_slab(&sc, shrinker, nr_scanned, nr_eligible);
 		/*
 		 * Bail out if someone want to register a new shrinker to
@@ -512,10 +525,10 @@ static unsigned long shrink_slab(gfp_t gfp_mask, int nid,
 			break;
 		}
 	}
-
+    /* 释放锁 */
 	up_read(&shrinker_rwsem);
 out:
-	cond_resched();
+	cond_resched();//当前进程需要被调度，该进程休眠
 	return freed;
 }
 
@@ -2851,10 +2864,15 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
 	int z;
 
 	/* If not in reclaim/compaction mode, stop */
+    /* 如果sc当中没有设置内存回收或者是内存碎片整理模式则直接推出 */
 	if (!in_reclaim_compaction(sc))
 		return false;
 
 	/* Consider stopping depending on scan and reclaim activity */
+    /* 如果sc设置了__GFP_RETRY_MAYFAIL则进入一下判断当中
+     * 1. 如果nr_reclaimed nr_scanned都为空说明扫描的次数，与回收的page都为0则直接return false
+     * 2. 如果__GFP_RETRY_MAYFAIL没有使用该flag则如果回收的页面数为0则直接return false
+     */
 	if (sc->gfp_mask & __GFP_RETRY_MAYFAIL) {
 		/*
 		 * For __GFP_RETRY_MAYFAIL allocations, stop reclaiming if the
@@ -2881,20 +2899,33 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
 	 * If we have not reclaimed enough pages for compaction and the
 	 * inactive lists are large enough, continue reclaiming
 	 */
+	/* 根据order计算出内存回收两倍的页面数也就是2*1^order */
 	pages_for_compaction = compact_gap(sc->order);
+    /* 获取当前zone中非活动file类型页面的个数 */
 	inactive_lru_pages = node_page_state(pgdat, NR_INACTIVE_FILE);
+    /* 如果swap交换的pages页面大于0，则inactive_lru_pages加上当前zone的非活动ANON匿名页面的个数，这样就获取到了zone 所有的非活动页面数，也就是能回收的最大页面数 */
 	if (get_nr_swap_pages() > 0)
 		inactive_lru_pages += node_page_state(pgdat, NR_INACTIVE_ANON);
+    /* 如果想要回收的页数pages小于内存整理回收的order请求两倍的页面，
+     * 且非活动lru页面数 >      2倍的内存分配请求页面数 则直接return true  继续进行内存回收操作，目的在于想要回收更多的page
+     */
 	if (sc->nr_reclaimed < pages_for_compaction &&
 			inactive_lru_pages > pages_for_compaction)
 		return true;
 
 	/* If compaction would go ahead or the allocation would succeed, stop */
+    /* 遍历该zone区域，直到reclaim_idx为止 */
 	for (z = 0; z <= sc->reclaim_idx; z++) {
 		struct zone *zone = &pgdat->node_zones[z];
-		if (!managed_zone(zone))
+		if (!managed_zone(zone))//如果该zone区域不在buddy system管理区域当中则直接continue跳过zone区域
 			continue;
-
+      
+        /*
+         * 如果碎片整理成功，则说明由足够的freetype空闲页面可供内存分配请求使用，直接return false 退出内存回收，直接分配内存即可
+         * 如果内存碎片整理继续则说明该zone当中没有足够的freepages空闲页面供内存分配使用，在该zone区域做内存回收是没有意义的，无法获取到足够的页面供内存分配使用
+         * 所以直接return false不再做内存回收操作。
+         * 所以针对这两种情况直接结束内存回收操作即可。
+         */
 		switch (compaction_suitable(zone, sc->order, 0, sc->reclaim_idx)) {
 		case COMPACT_SUCCESS:
 		case COMPACT_CONTINUE:
@@ -2904,6 +2935,7 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
 			;
 		}
 	}
+    /* 遍历的所有区域中压缩均未成功，则返回true表示压缩应继续 */
 	return true;
 }
                     
@@ -2998,6 +3030,9 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 		 * Shrink the slab caches in the same proportion that
 		 * the eligible LRU pages were scanned.
 		 */
+		 /* 如果是对于整个zone进行回收，那么会遍历所有memcg，对所有memcg中此zone的lru链表进行回收 
+          * 而如果只是针对某个memcg进行回收，如果回收到了足够内存则返回，如果没回收到足够内存，则对此memcg下面的memcg进行回收
+          */
 		if (global_reclaim(sc))
 			shrink_slab(sc->gfp_mask, pgdat->node_id, NULL,
 				    sc->nr_scanned - nr_scanned,
@@ -3009,13 +3044,19 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 		}
 
 		/* Record the subtree's reclaim efficiency */
+        /* 计算此memcg的内存压力，保存到memcg->vmpressure */
 		vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
 			   sc->nr_scanned - nr_scanned,
 			   sc->nr_reclaimed - nr_reclaimed);
 
 		if (sc->nr_reclaimed - nr_reclaimed)
 			reclaimable = true;
-
+    /* 判断是否再次此zone进行内存回收 
+     * 继续对此zone进行内存回收有两种情况:
+     * 1. 没有回收到比目标order值多一倍的数量页框，并且非活动lru链表中的页框数量 > 目标order多一倍的页
+     * 2. 此zone不满足内存压缩的条件，则继续对此zone进行内存回收
+     * 而当本次内存回收完全没有回收到页框时则返回，这里大概意思就是想回收比order更多的页框
+     */
 	} while (should_continue_reclaim(pgdat, sc->nr_reclaimed - nr_reclaimed,
 					 sc->nr_scanned - nr_scanned, sc));
 
