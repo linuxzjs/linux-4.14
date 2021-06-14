@@ -4097,6 +4097,10 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 	/*
 	 * 如果remaining = 0, !remaining = true说明kswapd进程是主动唤醒的，100m后自动唤醒链自己的kswapd进程
 	 * prepare_kswapd_sleep = true 则说明当前NODE节点中0到classzone_idx的zone区域是否都是zone_balanced的
+	 * 这里prepare_kswapd_sleep作用就是再timeout自动唤醒kswapd的基础上，检查此次zone是否内存平衡
+	 * true：进入if语句，kswapd通过调用schedule()继续随眠并让出cpu控制权
+	 * false：进入else语句块，执行kswapd线程后续内存回收操作
+	 * 此时说明zone区域内存已经平衡，kswapd内核进程已经休眠，不需要再执行
 	 */
 	if (!remaining &&
 	    prepare_kswapd_sleep(pgdat, reclaim_order, classzone_idx)) {
@@ -4111,7 +4115,10 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 		 * them before going back to sleep.
 		 */
 		set_pgdat_percpu_threshold(pgdat, calculate_normal_threshold);
-		/* 此时如果remaining = 0 说明kswapd进程已经被唤醒，如果kswapd线程没有停止则，schedule休眠让出当前cpu */
+		/* 此时如果remaining = 0 说明kswapd进程已经被唤醒，
+		 * 并且此时prepare_kswapd_sleep = true，说明zone区域内存已经平衡，不需要在做内存交换回收，下一步休眠该kswapd进程即可
+		 * 如果kswapd线程没有停止则，schedule休眠让出当前cpu，这个将是一个长时间的休眠操作
+		 */
 		if (!kthread_should_stop())
 			schedule();
 
