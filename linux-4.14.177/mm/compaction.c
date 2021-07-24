@@ -2041,7 +2041,7 @@ enum compact_result try_to_compact_pages(gfp_t gfp_mask, unsigned int order,
 								ac->nodemask) {
 		enum compact_result status;
         /* 
-         * 如果prio优先级大于MIN_COMPACT_PRIORITY，且order > zone->compact_order_failed时是不需要continue跳过的该zone
+         * 如果prio优先级大于MIN_COMPACT_PRIORITY，且order < zone->compact_order_failed时是不需要continue跳过的该zone
          * zone->compact_considered是否小于1UL << zone->compact_defer_shift
          * 小于则推迟，并且zone->compact_considered++，也就是这个函数会主动去推迟此管理区的内存碎片整理
          * 本次请求的order值小于之前失败时的order值，那这次整理必须要进行

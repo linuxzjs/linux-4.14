@@ -1023,7 +1023,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 		VM_BUG_ON_PAGE(PageActive(page), page);
         /* 扫描的页数量++ */
 		sc->nr_scanned++;
-        /* 如果此页被锁在内存中，则跳转到cull_mlocked */  
+        /* 如果此页被锁在内存中，则跳转到activate_locked */  
 		if (unlikely(!page_evictable(page)))
 			goto activate_locked;
          /* 如果扫描控制结构中标识不允许进行unmap操作，并且此页有被映射到页表中，跳转到keep_locked */
@@ -1129,7 +1129,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			    test_bit(PGDAT_WRITEBACK, &pgdat->flags)) {
 			    /* 增加nr_immediate计数，此计数说明此页准备就可以回收了 */
 				nr_immediate++;
-                /* 跳转到keep_locked */
+                /* 跳转到activate_locked */
 				goto activate_locked;
 
 			/* Case 2 above */
@@ -1434,7 +1434,6 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 					 * increment nr_reclaimed here (and
 					 * leave it off the LRU).
 					 */
-					/* 不明白？？？？？？？？？？？？？？？？？？？？？？？？？？？？？？？？？？？？需要进一步分析 */
 					nr_reclaimed++;
 					continue;
 				}
@@ -2005,13 +2004,20 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 	spin_lock_irq(&pgdat->lru_lock);
     /* 从lruvec这个lru链表描述符的lru类型的lru链表中隔离最多nr_to_scan个页出来，隔离时是从lru链表尾部开始拿，然后放到page_list 
      * 返回隔离了多少个此非活动lru链表的页框
+     * 这里lru代表的是一种类型，更加准确的来说应该是非活动页面的类型LRU_INACTIVE_FILE、LRU_INACTIVE_ANON
+     * 根据isolate_mode的模式进行lru类型的回收
      */
 	nr_taken = isolate_lru_pages(nr_to_scan, lruvec, &page_list,
 				     &nr_scanned, sc, isolate_mode, lru);
-    /* 此zone对应隔离的ANON/FILE页框数量 */
+    /* 此zone对应隔离的ANON/FILE页框数量
+     * 此时这里flie的判断就变得更加高效，
+     * 如果file = true 说明lru的类型是LRU_INACTIVE_FILE，此时从lruvece根据mode隔离lru类型的页面，并将回收的隔离的页框数累加到pgdat当中
+     * 如果file = false说明lru类型是LRU_INACTIVE_ANON，此时从lruvece根据mode隔离lru类型的页面，并将回收的隔离的页框数累加到pgdat当中
+     */
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
     /* 设置zone当前扫描的页框数，扫描的可以是ANON/FILE不同类型的页框数，
-     * 当file = 0时，为anon，如果file = true则说明时file类型页面
+     * 如果file = false时，则LRU_INACTIVE_ANON，更新s扫描到的非活动匿名页数
+     * 如果file = true 则lru类型LRU_INACTIVE_FILE，更新此时扫已经扫描的页框数
      */
 	reclaim_stat->recent_scanned[file] += nr_taken;
     /*
@@ -2068,7 +2074,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
      * 因为隔离出来时page->_refcount++，而在lru中是不需要对page->_refcount++的
      */
 	putback_inactive_pages(lruvec, &page_list);
-    /* 更新此zone对应隔离的ANON/FILE页框数量，这里减掉了nr_taken，与此函数之前相对应 */
+    /* 更新此zone对应隔离的ANON/FILE页框数量，这里由于将隔离的页面重新添加到了lruvec当中所以减掉了nr_taken，与此函数之前相对应 */
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
 
 	spin_unlock_irq(&pgdat->lru_lock);
@@ -2645,7 +2651,6 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
 	/* 如果最近匿名页面扫描次数 > 计算出的匿名页面总和的25%
 	 * 则设置reclaim_stat->recent_scanned[0] /= 2;降低这个最近扫描比例，
 	 * 对于reclaim_stat->recent_rotated[0] /= 2也是这样，降低旋转页面的比例
-	 * 作用是什么？为什么要这样做？
 	 */
 	if (unlikely(reclaim_stat->recent_scanned[0] > anon / 4)) {
 		reclaim_stat->recent_scanned[0] /= 2;
@@ -2654,7 +2659,6 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
 	/* 如果最近文件页面扫描次数 > 计算出的文件页面总和的25%
 	 * 则设置reclaim_stat->recent_scanned[1] /= 2;降低这个最近扫描比例，
 	 * 对于reclaim_stat->recent_rotated[1] /= 2;也是这样，降低旋转页面的比例
-	 * 作用是什么？为什么要做此类设置
 	 */
 	if (unlikely(reclaim_stat->recent_scanned[1] > file / 4)) {
 		reclaim_stat->recent_scanned[1] /= 2;
@@ -2761,7 +2765,7 @@ static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
 	get_scan_count(lruvec, memcg, sc, nr, lru_pages);
 
 	/* Record the original scan target for proportional adjustments later */
-    /* 将nr的数据复制到targets中 */
+    /* 将nr的数据复制到targets中，用于后续的回收不同类型的内存比例计算 */
 	memcpy(targets, nr, sizeof(nr));
 
 	/*
@@ -2797,6 +2801,8 @@ static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
         
         /* 以LRU_INACTIVE_ANON，LRU_ACTIVE_ANON，LRU_INACTIVE_FILE，LRU_ACTIVE_FILE这个顺序遍历lru链表 
          * 然后对遍历到的lru链表进行扫描，一次最多32个页框
+         * 这里需要明确的时，在这个遍历扫描nr当中，只是进行一轮从nr[lru]当中回收nr_to_scan这么多的page，
+         * 内存回收后nr[lru]不一定为NULL，所以才会在最后获取一下剩余的nr_file、nr_anon的量
          */
 		for_each_evictable_lru(lru) {
             /* nr[lru类型]如果有页框需要扫描 */
@@ -2851,24 +2857,33 @@ static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
          * 调用到这里肯定是kswapd进程或者针对memcg的页框回收，并且已经回收到了足够的页框了
          * 如果nr[]中还剩余很多数量的页框没有扫描，这里就通过计算，减少一些nr[]待扫描的数量
          * 设置scan_adjusted，之后把nr[]中剩余的数量扫描完成
+         * 该判断的目的在于后续将扫描权重偏向于页面数量较多的lru类型的链表。
          */
 		if (nr_file > nr_anon) {
              /* 剩余需要扫描的文件页多于剩余需要扫描的匿名页时 */
             /* 原始的需要扫描匿名页数量 */
 			unsigned long scan_target = targets[LRU_INACTIVE_ANON] +
 						targets[LRU_ACTIVE_ANON] + 1;
+            /* 设置当前lru链表类型为LRU_BASE也就是非活动匿名页面LRU_INACTIVE_ANON */
 			lru = LRU_BASE;
-             /* 计算剩余的需要扫描的匿名页数量占 */
+             /* 计算剩余的需要扫描的匿名页数量占原有的内存回收前的匿名页面的比例 */
 			percentage = nr_anon * 100 / scan_target;
 		} else {
             /* 剩余需要扫描的文件页少于剩余需要扫描的匿名页时 */
 			unsigned long scan_target = targets[LRU_INACTIVE_FILE] +
 						targets[LRU_ACTIVE_FILE] + 1;
+            /* 设置当前lru为非活动文件页面LRU_INACTIVE_FILE */
 			lru = LRU_FILE;
+            /* 计算内存回收后剩余文件页面占原有内存回收前文件页面的百分比 */
 			percentage = nr_file * 100 / scan_target;
 		}
 
 		/* Stop scanning the smaller of the LRU */
+        /* 通过上面的判断将剩余页面小的lru类型页面重置为0， 停止对小的lru链表的扫描
+         * 如果是nr_anon小则重置匿名页，停止对匿名页的扫描
+         * 如果是nr_file小则重置文件页，停止对文件页的扫描
+         * 在while()当中这种nr[lru] = 0、nr[lru + LRU_ACTIVE] = 0;在下一轮的扫描当中就会跳过这两种类型的页面
+         */
 		nr[lru] = 0;
 		nr[lru + LRU_ACTIVE] = 0;
 
@@ -2876,16 +2891,31 @@ static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
 		 * Recalculate the other LRU scan count based on its original
 		 * scan target and the percentage scanning already complete
 		 */
+		/* 这个判断很有趣要结合上文进行分析，刚才说了系统偏重于扫描剩余页面多的lru链表，就在这里体现出来了
+		 * 如果是nr_anon小则lru = LRU_BASE，这样根据这个判断可以知道lru此时变成了lru = LRU_FILE,
+		 * 下面依次进行LRU_INACTIVE_FILE、LRU_ACTIVE_FILE的扫描
+         * 如果是nr_file小则lru = LRU_FILE，这样根据这个判断可以知道lru此时变成了lru = LRU_BASE
+         * 下面依次进行LRU_INACTIVE_ANON、LRU_ACTIVE_ANON进行计算扫描
+		 */
 		lru = (lru == LRU_FILE) ? LRU_BASE : LRU_FILE;
+        /* 将回收前的非活动页面减去目前剩余的非活动页面，得到本次内存回收扫描过的非活动页面数 */
 		nr_scanned = targets[lru] - nr[lru];
+        /* (100% - 剩余lru的百分比) = 理论上被扫描的lru页面比例，然后乘以回收前lru类型的总量，得到了此轮此轮内存回收扫描过的页面数                                */
 		nr[lru] = targets[lru] * (100 - percentage) / 100;
+        /* 本轮内存回收扫描的页面减去以上两种计算方式获取到的内存回收扫描的页面nr_scanned、nr[lru]最小的那个，
+         * 得到下轮需要扫描的nr[lru]非活动页面 
+         * 如果nr[lru]小则nr[lru] - nr[lru] = 0，停止扫描
+         * 如果nr_scanned小，则nr[lru] - nr_scanned > 0，进行下一轮内存回收就从扫描理论计算与实际差值中进行
+         */
 		nr[lru] -= min(nr[lru], nr_scanned);
 
 		lru += LRU_ACTIVE;
 		nr_scanned = targets[lru] - nr[lru];
 		nr[lru] = targets[lru] * (100 - percentage) / 100;
+        /* 同上得到下轮 内存回收需要扫描的活动页面的差值 */
 		nr[lru] -= min(nr[lru], nr_scanned);
-
+        
+        /* 策略调整一次后，后续不再进行策略调整 */
 		scan_adjusted = true;
 	}
 	blk_finish_plug(&plug);
@@ -2896,8 +2926,8 @@ static void shrink_node_memcg(struct pglist_data *pgdat, struct mem_cgroup *memc
 	 * Even if we did not try to evict anon pages at all, we want to
 	 * rebalance the anon lru active/inactive ratio.
 	 */
-	/* 非活动匿名页lru链表中页数量太少 */
-    /* 从活动匿名页lru链表中移动一些页去非活动匿名页lru链表，最多32个 */
+	/* 非活动匿名页lru链表中页数量太少 
+     * 从活动匿名页lru链表中移动一些页去非活动匿名页lru链表，最多32个 */
 	if (inactive_list_is_low(lruvec, false, sc, true))
 		shrink_active_list(SWAP_CLUSTER_MAX, lruvec,
 				   sc, LRU_ACTIVE_ANON);
@@ -3025,9 +3055,13 @@ static bool shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 		};
 		unsigned long node_lru_pages = 0;
 		struct mem_cgroup *memcg;
-        /* 记录本次回收开始前回收到的页框数量，第一次是0 */
+        /* 记录本次回收开始前回收到的页框数量，第一次是0,
+         * nr_reclaimed代表已经回收的页面
+         */
 		nr_reclaimed = sc->nr_reclaimed;
-        /* 记录本次内存回收前扫描的页框的数量 */
+        /* 记录本次内存回收前扫描的页框的数量
+         * nr_scanned代表已经扫描过的页面
+         */
 		nr_scanned = sc->nr_scanned;
         /* 获取最上层的memcg
          * 如果没有指定开始的root，则默认是root_mem_cgroup
@@ -3329,7 +3363,7 @@ retry:
 
 	do {
         /*
-         * 完成内存回收压力等级的计算，通过不同的压力等级判断后续内存回收的方式
+         * 完成内存回收压力等级的计算，通过不同的sc->priority优先级判断后续内存回收的方式
          * low level正常回收，medium level就是开始swaping，critical就是内存严重不足启动OOM释放内存
          */
 		vmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,
@@ -3353,6 +3387,8 @@ retry:
 		 */
 		/*
 		 * 将优先级再提高两个步骤来设置处理时的写页功能
+		 * 当sc->priority优先级小于10时，对于原有不允许进行页面回写的页面允许回写操作，然后回收页面
+		 * 原有时如果小于10还不允许回写就会导致内存回收困难
          */
 		if (sc->priority < DEF_PRIORITY - 2)
 			sc->may_writepage = 1;
@@ -3494,7 +3530,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
      */
 	for_each_zone_zonelist_nodemask(zone, z, zonelist,
 					gfp_zone(gfp_mask), nodemask) {
-		/*在arm64当中只能扫描ZONE_NORMAL、ZONE_MOVABLE */
+		/*在arm64当中只能扫描ZONE_NORMAL、ZONE_DMA */
 		if (zone_idx(zone) > ZONE_NORMAL)
 			continue;
 
