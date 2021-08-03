@@ -1544,19 +1544,24 @@ unsigned long reclaim_clean_pages_from_list(struct zone *zone,
 	};
 	unsigned long ret;
 	struct page *page, *next;
+    /* 初始化一个clean_pages空的链表 */
 	LIST_HEAD(clean_pages);
-
+    /* 遍历page_list链表将可用的page移动到clean_pages当中，完成初步的回收操作 */
 	list_for_each_entry_safe(page, next, page_list, lru) {
+	    /*
+	     * 当该page满足条件时，就cleanPageActive page,然后将page，移动到clean_page链表当中
+         */
 		if (page_is_file_cache(page) && !PageDirty(page) &&
 		    !__PageMovable(page) && !PageUnevictable(page)) {
 			ClearPageActive(page);
 			list_move(&page->lru, &clean_pages);
 		}
 	}
-
+    /* 根据sc回收要求，从当前node当中回收可用的page，并将page移动到clean_pages链表，并将回收后的页面移动到page_list链表当中 */
 	ret = shrink_page_list(&clean_pages, zone->zone_pgdat, &sc,
 			TTU_IGNORE_ACCESS, NULL, true);
 	list_splice(&clean_pages, page_list);
+    /* node当中的page减去ret被回收的页面数，得到目前Node可用的页面数 */
 	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE, -ret);
 	return ret;
 }

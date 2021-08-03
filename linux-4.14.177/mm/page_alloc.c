@@ -1631,29 +1631,47 @@ void __init page_alloc_init_late(void)
 /* Free whole pageblock and set its migration type to MIGRATE_CMA. */
 void __init init_cma_reserved_pageblock(struct page *page)
 {
+    /* 设置i = pageblock_nr_pages */
 	unsigned i = pageblock_nr_pages;
 	struct page *p = page;
-
+    
 	do {
+        /* 清除页描述flag中的PG_Reserved标志位 */
 		__ClearPageReserved(p);
+        /* 设置page->_refcount = 0，在初始化阶段说明给page没有被其他进程建立映射关系，没有被使用 */
 		set_page_count(p, 0);
 	} while (++p, --i);
-
+    /* 设置cma area区域的page移动类型为MIGRATE_CMA */
 	set_pageblock_migratetype(page, MIGRATE_CMA);
 
+  
 	if (pageblock_order >= MAX_ORDER) {
+        /* 
+         * 如果pageblock_order >= MAX_ORDER 则设置 i = pageblock_nr_pages
+         */
 		i = pageblock_nr_pages;
 		p = page;
 		do {
+            /* 上面已经修改了page的移动类型，说明此时该page已经被内核进程建立的映射关系，所以page->_refcount + 1*/
 			set_page_refcounted(p);
+            /* 通过调用__free_pages -> __free_pages_ok    -> free_one_page -> __free_one_page(page, pfn, zone, order, migratetype)
+             * 将page释放到MIGRATE_CMA的free_list当中，最终就体现再list_add(&page->lru, &zone->free_area[order].free_list[migratetype])当中
+             */
 			__free_pages(p, MAX_ORDER - 1);
+            /* page自加MAX_ORDER_NR_PAGES，获取到page新的起始地址，根据while循环结果进一步完成page的释放，
+             * 将pageblock_order - MAX_ORDER_NR_PAGES的差值重新进行释放
+             */
 			p += MAX_ORDER_NR_PAGES;
 		} while (i -= MAX_ORDER_NR_PAGES);
 	} else {
+        /* 上面已经修改了page的移动类型，说明此时该page已经被内核进程建立的映射关系，所以page->_refcount + 1 */
 		set_page_refcounted(page);
+        /* pageblock_order < MAX_ORDER，说明对应的pageblock size < pageblock_nr_pages则直接进入__free_pages根据pageblock_order直接释放即可 */
 		__free_pages(page, pageblock_order);
 	}
-
+    /* 调整对应zone中的managed_pages可管理页pages的个数
+     * 也是调整zone区域buddy system管理的page页数，
+     * 将cma area区域的pages以pageblcok为单位添加到zone区域在buddy system管理的区域当中 */
 	adjust_managed_page_count(page, pageblock_nr_pages);
 }
 #endif
@@ -7769,30 +7787,43 @@ static int __alloc_contig_migrate_range(struct compact_control *cc,
 	int ret = 0;
 
 	migrate_prep();
-
+    /* 在pfn ~ end之间进行内存迁移分配操作
+     * 当pfn < end或者是cc->migratepages ！= NULL， 则计入循环当中
+     * 如果这两个条件都不满足则跳出循环
+     */
 	while (pfn < end || !list_empty(&cc->migratepages)) {
+        /* 当current当前进程接收到阻塞信号时直接休眠，break结束 */
 		if (fatal_signal_pending(current)) {
 			ret = -EINTR;
 			break;
 		}
-
+        /* 当cc->migratepages链表为NULL时，进入判断当中 */
 		if (list_empty(&cc->migratepages)) {
+            /* 设置compact_control cc隔离链表个数为0 */
 			cc->nr_migratepages = 0;
+            /* 从pfn ~ end页框号区间隔离出迁移页面，填充cc->migratepages，并返回迁移后的page页框号
+             * 如果pfn = NULL则直接break,结束循环
+             */
 			pfn = isolate_migratepages_range(cc, pfn, end);
 			if (!pfn) {
 				ret = -EINTR;
 				break;
 			}
+            /* migratepages页面隔离成功，重置tries尝试次数 */
 			tries = 0;
 		} else if (++tries == 5) {
+            /* 当cc->migratepage不为空，tries失败5次返回ret值，并break结束循环 */
 			ret = ret < 0 ? ret : -EBUSY;
 			break;
 		}
-
+        /* 从cc->zone区域根据条件回收内存页面并将页面转移到cc->migratepages链表当中 */
 		nr_reclaimed = reclaim_clean_pages_from_list(cc->zone,
 							&cc->migratepages);
+        /* cc->zone当中可以迁移页面数减去回收的页面数，得到当前zone区域可用的迁移页面数 */
 		cc->nr_migratepages -= nr_reclaimed;
-
+        /*
+         * 
+         */
 		ret = migrate_pages(&cc->migratepages, alloc_migrate_target,
 				    NULL, 0, cc->mode, MR_CMA);
 	}
@@ -7830,15 +7861,16 @@ int alloc_contig_range(unsigned long start, unsigned long end,
 	unsigned long outer_start, outer_end;
 	unsigned int order;
 	int ret = 0;
-
+    /* 对compact_control结构体进行初始化操作 */
 	struct compact_control cc = {
 		.nr_migratepages = 0,
 		.order = -1,
-		.zone = page_zone(pfn_to_page(start)),
-		.mode = MIGRATE_SYNC,
+		.zone = page_zone(pfn_to_page(start)),//获取当前start pfn对应的page所在的zone区域
+		.mode = MIGRATE_SYNC, //设置内存整理的模式
 		.ignore_skip_hint = true,
 		.gfp_mask = current_gfp_context(gfp_mask),
 	};
+    /* 初始化一个cc.migratepages链表将隔离的page转移到这个链表当中 */
 	INIT_LIST_HEAD(&cc.migratepages);
 
 	/*
@@ -7864,7 +7896,11 @@ int alloc_contig_range(unsigned long start, unsigned long end,
 	 * aligned range but not in the unaligned, original range are
 	 * put back to page allocator so that buddy can use them.
 	 */
-
+    /*
+     * 将start pfn ~ end pfn之间的MIGRATE_CMA类型的page进行隔离
+     * 将page的类型设置成MIGRATE_ISOLATE，这样在后续的buddy system的内存分配时就无法访问MIGRATE_ISOLATE类型的cma page
+     * 完成隔离后如果是return -BUSY则直接return结束cma area区域的内存分配，如果ret = 0说明page设置MIGRATE_ISOLATE成功
+     */
 	ret = start_isolate_page_range(pfn_max_align_down(start),
 				       pfn_max_align_up(end), migratetype,
 				       false);
