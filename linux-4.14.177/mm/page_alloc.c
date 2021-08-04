@@ -7801,7 +7801,7 @@ static int __alloc_contig_migrate_range(struct compact_control *cc,
 		if (list_empty(&cc->migratepages)) {
             /* 设置compact_control cc隔离链表个数为0 */
 			cc->nr_migratepages = 0;
-            /* 从pfn ~ end页框号区间隔离出迁移页面，填充cc->migratepages，并返回迁移后的page页框号
+            /* 把cma area区域当需要分配的pfn ~ end页框号之间的page根据isolate_mode将可迁移的页面隔离出来，填充cc->migratepages，并返回迁移后的page页框号
              * 如果pfn = NULL则直接break,结束循环
              */
 			pfn = isolate_migratepages_range(cc, pfn, end);
@@ -7822,7 +7822,9 @@ static int __alloc_contig_migrate_range(struct compact_control *cc,
         /* cc->zone当中可以迁移页面数减去回收的页面数，得到当前zone区域可用的迁移页面数 */
 		cc->nr_migratepages -= nr_reclaimed;
         /*
-         * 
+         * 将cc->migratepages可迁移页面的内容移动到alloc_migrate_target freepages链表完成页面的整理，
+         * 同时完成cc->migratepages的unmap_and_move操作将cma area pfn ~ end之间的
+         * 被使用的migratepages的映射断开，这样cma pfn ~ end之间的page变成了freepages空闲页，供cma_alloc分配使用
          */
 		ret = migrate_pages(&cc->migratepages, alloc_migrate_target,
 				    NULL, 0, cc->mode, MR_CMA);
@@ -7917,6 +7919,9 @@ int alloc_contig_range(unsigned long start, unsigned long end,
 	 * allocated.  So, if we fall through be sure to clear ret so that
 	 * -EBUSY is not accidentally used or returned to caller.
 	 */
+	/* 将cma area区域start ~ end之间的被使用的migratepages移动alloc_migrate_target freepages链表上，完成a start pfn ~ end之间的
+	 * 内存page的整理，将start ~ end migratepages变成freepages，供cma_alloc分配连续空间使用，此时设置ret = 0说明cma area区间内存分配成功
+	 */
 	ret = __alloc_contig_migrate_range(&cc, start, end);
 	if (ret && ret != -EBUSY)
 		goto done;
@@ -7942,17 +7947,29 @@ int alloc_contig_range(unsigned long start, unsigned long end,
 	lru_add_drain_all();
 	drain_all_pages(cc.zone);
 
+    /* 设置order = 0,且将cma_alloc在cma area区域分配的内存的起始页框号赋值给outer_start */
 	order = 0;
 	outer_start = start;
+	/* 将pfn页框号转换成page，判断该page是否在buddy system当中，如果page不属于buddy则进入while循环
+	 */
 	while (!PageBuddy(pfn_to_page(outer_start))) {
+		/* order++,
+		 * 当order > MAX_ORDER时，将outer_start = start;break跳出循环
+		 * 当order < MAX_ORDER时，执行outer_start &= ~0UL << order;目的在于:通过这个操作，使outer_start对应page的起始地址都是2^order的倍数
+		 * 将outer_start向后移动，作为当前order的起始页
+		 */
 		if (++order >= MAX_ORDER) {
 			outer_start = start;
 			break;
 		}
 		outer_start &= ~0UL << order;
 	}
-
+    /* 
+     * 当outer_start != start则说明cma_alloc计划分配的page并不是在对应order的起始页，
+     * 需要进入判断当中进一步分析
+     */
 	if (outer_start != start) {
+        /* 获取outer_start页框号对应的page，并获取该page对应的order值 */
 		order = page_order(pfn_to_page(outer_start));
 
 		/*
@@ -7961,11 +7978,16 @@ int alloc_contig_range(unsigned long start, unsigned long end,
 		 * in this case to report failed page properly
 		 * on tracepoint in test_pages_isolated()
 		 */
+		 /* 如果outer_start + 2^order个页框，小于等于start原始页框则将outer_start = start防止过多的申请内存 */
 		if (outer_start + (1UL << order) <= start)
 			outer_start = start;
 	}
 
 	/* Make sure the range is really isolated. */
+    /* 用于检查确保outer_start ~ end 该范围内的页面已经被隔离
+     * 如果没有被完全isolate隔离则说明cma通过bitmap找到的start_pfn ~ end这段页框中存在问题，直接跳转到goto done
+     * 如果没有说明被完全隔离了
+     */
 	if (test_pages_isolated(outer_start, end, false)) {
 		pr_info_ratelimited("%s: [%lx, %lx) PFNs busy\n",
 			__func__, outer_start, end);
@@ -7974,6 +7996,11 @@ int alloc_contig_range(unsigned long start, unsigned long end,
 	}
 
 	/* Grab isolated pages from freelists. */
+    /* 通过__alloc_contig_migrate_range当中的migrate_pages操作，已经将原计划的start_pfn ~ end这中间的migratepages全部转移到了其他的freepages
+     * 此时start_pfn ~ end这段空间的page本身就是一个连续的freepages从理论上来讲，因此通过isolate_freepages_range完成outer_start ~ end之间的freepages
+     * 页面的隔离操作，将page转移到cc->freepages当中，并返回隔离的freepages页框数，
+     * 如果outer_end < 0则说明outer_start ~ end没有可用的freepages，则直接goto done
+     */
 	outer_end = isolate_freepages_range(&cc, outer_start, end);
 	if (!outer_end) {
 		ret = -EBUSY;
@@ -7981,12 +8008,22 @@ int alloc_contig_range(unsigned long start, unsigned long end,
 	}
 
 	/* Free head and tail (if any) */
+    /* 使用free_contig_range将多余的page从isolate释放出来，添加到buddy system当中，减少buddy system内存分配的压力
+     * 可能存在的情况：
+     * 1. outer_start     start  (使用这段即可) end，将outer_start ~ start这段的释放到buddy system当中
+               |------------|-------------------|
+     * 2. start  (使用这段即可)  end      outer_end,将多余的end ~ outer_end释放到buddy system当中
+            |--------------------|------------|
+     */
 	if (start != outer_start)
 		free_contig_range(outer_start, start - outer_start);
 	if (end != outer_end)
 		free_contig_range(end, outer_end - end);
 
 done:
+    /* 将migrate isolate隔离的page的migratetype从MIGRATE_ISOLATE修改成MIGRATE_CMA,供cma使用
+     * 此时就是想isolate修改为cma类型，并没有将start ~ end之间的page重新添加到buddy system当中，这点切记切记
+     */
 	undo_isolate_page_range(pfn_max_align_down(start),
 				pfn_max_align_up(end), migratetype);
 	return ret;
