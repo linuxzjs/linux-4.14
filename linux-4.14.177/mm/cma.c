@@ -206,24 +206,27 @@ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
 {
 	struct cma *cma;
 	phys_addr_t alignment;
-
+    /* 当cna_area数组被完全占用后直接return false */
 	/* Sanity checks */
 	if (cma_area_count == ARRAY_SIZE(cma_areas)) {
 		pr_err("Not enough slots for CMA reserved regions!\n");
 		return -ENOSPC;
 	}
-
+    /* size = 0或者时请求的内存区域不在reserved内存保留区域当中，则直接return */
 	if (!size || !memblock_is_region_reserved(base, size))
 		return -EINVAL;
 
 	/* ensure minimal alignment required by mm core */
+    /* pageblock为单位对cma区域做内存对齐操作，为4M对齐 */
 	alignment = PAGE_SIZE <<
 			max_t(unsigned long, MAX_ORDER - 1, pageblock_order);
 
 	/* alignment should be aligned with order_per_bit */
+    /* alignment >> PAGE_SHIFT计算出当前order，如果不是以 order_per_bit 为单位对齐的，则return */
 	if (!IS_ALIGNED(alignment >> PAGE_SHIFT, 1 << order_per_bit))
 		return -EINVAL;
-
+    
+    /* 如果base基地址没有对齐，或者时size没有对齐则直接return */
 	if (ALIGN(base, alignment) != base || ALIGN(size, alignment) != size)
 		return -EINVAL;
 
@@ -231,6 +234,9 @@ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
 	 * Each reserved area must be initialised later, when more kernel
 	 * subsystems (like slab allocator) are available.
 	 */
+	/*
+	 * 将cam_area区域赋值给cma结构体，判断是否命名，如果命名则使用既定的名字，如果没有采用默认cma作为cma_area区域明明
+     */
 	cma = &cma_areas[cma_area_count];
 	if (name) {
 		cma->name = name;
@@ -239,10 +245,16 @@ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
 		if (!cma->name)
 			return -ENOMEM;
 	}
+    /* 初始化当前cma,
+     * 将保留区域base赋值给base_pfn作为cma_area区域的起始页框号
+     * 通过size >> PAGE_SHIFT可知当前cma区域一共有多少个pages
+     * order_per_bit用于描述每个bitmap位图所占用的pages数也就是2^order_per_bit，在我看来就是bitmap概念与pageblock时相似的
+     */
 	cma->base_pfn = PFN_DOWN(base);
 	cma->count = size >> PAGE_SHIFT;
 	cma->order_per_bit = order_per_bit;
 	*res_cma = cma;
+    /* cma_area_count++, size / PAGE_SIZE代表该cma区域的pages,累加就是所有的cma区域的总页数也就是totalcma_pages，至此完成cma区域的初始化操作  */
 	cma_area_count++;
 	totalcma_pages += (size / PAGE_SIZE);
 
@@ -272,6 +284,7 @@ int __init cma_declare_contiguous(phys_addr_t base,
 			phys_addr_t alignment, unsigned int order_per_bit,
 			bool fixed, const char *name, struct cma **res_cma)
 {
+    /* 获取memory内存映射的最终结束区域地址 */
 	phys_addr_t memblock_end = memblock_end_of_DRAM();
 	phys_addr_t highmem_start;
 	int ret = 0;
@@ -282,18 +295,21 @@ int __init cma_declare_contiguous(phys_addr_t base,
 	 * complain. Find the boundary by adding one to the last valid
 	 * address.
 	 */
+	/* 将内核态虚拟地址转化为物理地址 */
 	highmem_start = __pa(high_memory - 1) + 1;
 	pr_debug("%s(size %pa, base %pa, limit %pa alignment %pa)\n",
 		__func__, &size, &base, &limit, &alignment);
 
+    /* 当cna_area数组被完全占用后直接return false */
 	if (cma_area_count == ARRAY_SIZE(cma_areas)) {
 		pr_err("Not enough slots for CMA reserved regions!\n");
 		return -ENOSPC;
 	}
-
+    /* 当size = 0时也就是该区域内存为空，直接返回 */
 	if (!size)
 		return -EINVAL;
-
+    
+    /* 判断对齐参数是否为空，同时确认alignment是不是2幂数，这里与内存分配存在关系2^order */
 	if (alignment && !is_power_of_2(alignment))
 		return -EINVAL;
 
@@ -303,22 +319,39 @@ int __init cma_declare_contiguous(phys_addr_t base,
 	 * migratetype page by page allocator's buddy algorithm. In the case,
 	 * you couldn't get a contiguous memory, which is not what we want.
 	 */
+	/*
+	 * 通过pageblock_order,MAX_ORDER计算需要对齐的数据大小，
+	 * 在64位系统当中，CONFIG_HUGETLB_PAGE是否开启存在很大的不同
+	 * 当pageblock_order > MAX_ORDER -1时，此时对齐的方式就采用pageblock位单位，一个pageblock_order决定了这个pageblcok有多少个pages也就是2^order个page
+	 * PAGE_SIZE << pageblock_order = 4k * 2^order，这样alignment对齐就是：4k * 2^pageblock_order
+	 * 当 MAX_ORDER - 1 >= pageblock_order 此时可以知道这个这个pageblock = 4k * (11 -1) = 4M,这样下面的内存对齐就是以alignment = 4M位单位进行
+     */
 	alignment = max(alignment,  (phys_addr_t)PAGE_SIZE <<
 			  max_t(unsigned long, MAX_ORDER - 1, pageblock_order));
+    /*
+     * 当fixed为真，且base & (alignment - 1)为真时直接goto err
+     * 四处存在疑问，为什么要做这个判断，不明白不明白，场景时什么？
+     */
 	if (fixed && base & (alignment - 1)) {
 		ret = -EINVAL;
 		pr_err("Region at %pa must be aligned to %pa bytes\n",
 			&base, &alignment);
 		goto err;
 	}
+    /* 内存base基地址，size 大小对齐 */
 	base = ALIGN(base, alignment);
 	size = ALIGN(size, alignment);
+    /* 按对齐单元舍入下限 */
 	limit &= ~(alignment - 1);
 
+    /*
+     * 如果base基地址为 0，则将参数固定值更改为 false。
+     */
 	if (!base)
 		fixed = false;
 
 	/* size should be aligned with order_per_bit */
+    /* 如果size大小没有 2^order_per_bit 页 (4K) 对齐，则返回错误 */
 	if (!IS_ALIGNED(size >> PAGE_SHIFT, 1 << order_per_bit))
 		return -EINVAL;
 
@@ -326,6 +359,7 @@ int __init cma_declare_contiguous(phys_addr_t base,
 	 * If allocating at a fixed base the request region must not cross the
 	 * low/high memory boundary.
 	 */
+	/* 如果 fixed 为真,并且base ~ base + size该区域与 highmem 区域重叠，说明内存定义的边界存在问题则直接goto err */
 	if (fixed && base < highmem_start && base + size > highmem_start) {
 		ret = -EINVAL;
 		pr_err("Region at %pa defined on low/high memory boundary (%pa)\n",
@@ -338,9 +372,10 @@ int __init cma_declare_contiguous(phys_addr_t base,
 	 * value will be the memblock end. Set it explicitly to simplify further
 	 * checks.
 	 */
+	/* 如果 limit 为 0 或 limit 超过 memblock_end，则将 limit 设置为 memblock_end */
 	if (limit == 0 || limit > memblock_end)
 		limit = memblock_end;
-
+    /* 如果base + size > limit,则说明cma定义的区间大于memblock_end_of_DRAM内存最大的映射空间则直接goto err */
 	if (base + size > limit) {
 		ret = -EINVAL;
 		pr_err("Size (%pa) of region at %pa exceeds limit (%pa)\n",
@@ -350,6 +385,8 @@ int __init cma_declare_contiguous(phys_addr_t base,
 
 	/* Reserve memory */
 	if (fixed) {
+         /* 如果fixed不等于false,说明base != 0,  此时如果该区域已经在保留内存块中注册
+          * 或者在保留内存块中注册该区域时出错，则返回错误 */
 		if (memblock_is_region_reserved(base, size) ||
 		    memblock_reserve(base, size) < 0) {
 			ret = -EBUSY;
@@ -357,20 +394,27 @@ int __init cma_declare_contiguous(phys_addr_t base,
 		}
 	} else {
 		phys_addr_t addr = 0;
-
+        /* 如果fixed为false，如果要添加的区域是lowmem和highmem区域的边界，则首先尝试分配到highmem区域，如果失败则分配到lowmem区域。 */
 		/*
 		 * All pages in the reserved area must come from the same zone.
 		 * If the requested region crosses the low/high memory boundary,
 		 * try allocating from high memory first and fall back to low
 		 * memory in case of failure.
 		 */
+		 /* 
+		  * 当要添加的区域是highmem区域和lowmem区域的边界时
+		  * 在highmem_start 和 limit 之间分配请求大小
+		  * 并将highmem_start赋值给limit上
+		  */
 		if (base < highmem_start && limit > highmem_start) {
 			addr = memblock_alloc_range(size, alignment,
 						    highmem_start, limit,
 						    MEMBLOCK_NONE);
 			limit = highmem_start;
 		}
-
+        /* 如果地址为空则说明从highmem_start ~ limit的highmem区域地址分配失败
+         * 则从base ~ limit区域分配内存，如果内存分配失败则直接goto err
+         */
 		if (!addr) {
 			addr = memblock_alloc_range(size, alignment, base,
 						    limit,
@@ -385,10 +429,12 @@ int __init cma_declare_contiguous(phys_addr_t base,
 		 * kmemleak scans/reads tracked objects for pointers to other
 		 * objects but this address isn't mapped and accessible
 		 */
+		/* 忽略这个地址，这样它就不会被扫描并报告为泄漏 */
 		kmemleak_ignore_phys(addr);
 		base = addr;
 	}
-
+    
+    /* 对cma保留区域进行检查并完成结构体的初始化; */
 	ret = cma_init_reserved_mem(base, size, order_per_bit, name, res_cma);
 	if (ret)
 		goto free_mem;

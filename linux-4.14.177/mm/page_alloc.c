@@ -8029,6 +8029,7 @@ done:
 	return ret;
 }
 
+/* 释放cma_alloc分配的cma area pages,并将pages添加到buddy system系统当中。 */
 void free_contig_range(unsigned long pfn, unsigned nr_pages)
 {
 	unsigned int count = 0;
